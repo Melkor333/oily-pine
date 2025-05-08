@@ -1,0 +1,11 @@
+from alpine:edge
+
+ADD setup-build-env.sh /bin/setup-build-env.sh
+RUN setup-build-env.sh
+ADD build.sh /bin/build.sh
+USER packager
+WORKDIR /home/packager
+VOLUME ["/home/packager/.abuild"]
+VOLUME ["/home/packager/aports"]
+VOLUME ["/home/packager/packages"]
+ENTRYPOINT ["/bin/build.sh"]
