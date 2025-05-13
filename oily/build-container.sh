@@ -3,4 +3,4 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 cd "$SCRIPT_DIR"
 
-podman build build-container/ -t oily-pine-builder
+podman build container/ -t oily-pine-builder

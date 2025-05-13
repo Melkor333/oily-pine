@@ -14,6 +14,6 @@ else
     doas cp "$PACKAGER_PRIVKEY".pub /etc/apk/keys
 fi
 
-buildrepo $@ main
-buildrepo $@ community
-buildrepo $@ testing
+buildrepo -k -l "$HOME/logs" $@ main
+buildrepo -k -l "$HOME/logs" $@ community
+buildrepo -k -l "$HOME/logs" $@ testing
