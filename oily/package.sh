@@ -6,4 +6,4 @@ cd ..
 
 # This is an example on how to build packages using the container
 # It's relevant that the proper directories are mounted
-podman run -v ./:/home/packager/aports -v ./oily/abuild:/home/packager/.abuild -v ./oily/packages:/home/packager/packages --userns keep-id --cpus 4 oily-pine-builder $@
+podman run --rm -v ./:/home/packager/aports -v ./oily/abuild:/home/packager/.abuild -v ./oily/logs:/home/packager/logs -v ./oily/packages:/home/packager/packages --userns keep-id --cpus 4 oily-pine-builder $@ |& tee oily/logs/$(date +%y-%m-%d_%H:%M)-buildrepo.log
