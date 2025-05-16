@@ -16,6 +16,7 @@ adduser packager wheel
 su packager -c "abuild-keygen -na --install"
 mkdir -p /home/packager/aports
 mkdir -p /home/packager/packages
+chown -R packager /home/packager
 
 apk cache clean --purge
 
