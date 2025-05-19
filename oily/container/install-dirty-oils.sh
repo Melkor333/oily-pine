@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 
+set -e
+
+# to have readline!
+doas apk add readline-dev
+
 mkdir build
 cd build
 
-wget https://op.oilshell.org/uuu/github-jobs/9515/cpp-tarball.wwz/_release/oils-for-unix.tar
+wget https://op.oilshell.org/uuu/github-jobs/9569/cpp-tarball.wwz/_release/oils-for-unix.tar
 
 tar xvf oils-for-unix.tar
 rm oils-for-unix.tar
