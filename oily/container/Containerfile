@@ -1,18 +1,23 @@
-from alpine:edge
+from alpine:latest
 
 # Build setup
 ADD setup-build-env.sh /bin/setup-build-env.sh
 RUN setup-build-env.sh
-ADD build.sh /bin/build.sh
+# Use the build.sh in the repo!
+#ADD ./build-packages.sh /bin/build-packages.sh
 USER packager
 WORKDIR /home/packager
 
 # Build nightly Oils
 # Comment out for latest alpine build
 ADD install-dirty-oils.sh install-dirty-oils.sh
-RUN ./install-dirt-oils.sh
+RUN ./install-dirty-oils.sh
+
+# Patch buildrepo to use upstream packages
+# Apparently not necessary, only when `-s` is used...
+#RUN doas sed -i "s/APORTSDIR='%s' //" /usr/bin/buildrepo
 
 VOLUME ["/home/packager/.abuild"]
 VOLUME ["/home/packager/aports"]
 VOLUME ["/home/packager/packages"]
-ENTRYPOINT ["/bin/build.sh"]
+ENTRYPOINT ["/home/packager/aports/oily/package.sh"]
