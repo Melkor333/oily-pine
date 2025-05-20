@@ -8,7 +8,7 @@ pkgdesc="Userspace RCU (read-copy-update) library"
 url="https://liburcu.org/"
 arch="all"
 license="LGPL-2.1-or-later"
-makedepends="bash perl perl-utils"
+makedepends="cmd:bash perl perl-utils"
 subpackages="$pkgname-static $pkgname-dev $pkgname-doc"
 source="https://lttng.org/files/urcu/userspace-rcu-$pkgver.tar.bz2"
 

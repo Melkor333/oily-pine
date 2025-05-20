@@ -8,7 +8,7 @@ arch="all"
 options="!check"  # No test suite.
 license="GPL-2.0-or-later AND LGPL-2.1-or-later AND Zlib"
 subpackages="$pkgname-dev"
-depends="bash"
+depends="cmd:bash"
 makedepends="libxslt-dev"
 source="https://download.gnome.org/sources/rarian/0.8/rarian-$pkgver.tar.bz2
 	user-segfault.patch

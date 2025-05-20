@@ -13,7 +13,7 @@ depends="
 	$pkgname-ss
 	"
 makedepends="
-	bash
+	cmd:bash
 	bison
 	elfutils-dev
 	flex

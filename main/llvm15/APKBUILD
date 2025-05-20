@@ -23,7 +23,7 @@ makedepends_host="$depends_dev binutils-dev curl-dev libxml2-dev"
 makedepends_build="chrpath cmake python3 py3-setuptools samurai"
 # diffutils for diff: unrecognized option: strip-trailing-cr
 # coreutils for 'od' binary
-checkdepends="bash coreutils diffutils"
+checkdepends="cmd:bash coreutils diffutils"
 subpackages="$pkgname-static $pkgname-libs $pkgname-dev $pkgname-test-utils:_test_utils"
 source="https://github.com/llvm/llvm-project/releases/download/llvmorg-$pkgver/llvm-project-$pkgver.src.tar.xz
 	0001-Disable-dynamic-lib-tests-for-musl-s-dlclose-is-noop.patch

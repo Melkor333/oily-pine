@@ -6,7 +6,7 @@ pkgdesc="lightweight JSON library"
 url="http://www.digip.org/jansson/"
 arch="all"
 license="MIT"
-checkdepends="bash"
+checkdepends="cmd:bash"
 subpackages="$pkgname-static $pkgname-dev"
 source="https://github.com/akheron/jansson/releases/download/v$pkgver/jansson-$pkgver.tar.gz"
 

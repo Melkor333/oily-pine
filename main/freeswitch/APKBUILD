@@ -14,7 +14,7 @@ makedepends="
 	apr-dev
 	autoconf
 	automake
-	bash
+	cmd:bash
 	bsd-compat-headers
 	coreutils
 	curl-dev

@@ -10,7 +10,7 @@ url="https://packages.debian.org/source/sid/logcheck"
 arch="noarch"
 license="GPL-2.0-or-later"
 depends="
-	bash
+	cmd:bash
 	lockfile-progs
 	perl
 	"

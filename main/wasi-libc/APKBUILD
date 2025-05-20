@@ -16,7 +16,7 @@ options="!check" # no testsuite
 #   libc-top-half/musl/		- MIT
 license="Apache-2.0 WITH LLVM-exception AND Apache-2.0 AND MIT AND CC0-1.0 AND BSD-2-Clause"
 _llvmver=20
-makedepends="bash clang$_llvmver llvm$_llvmver"
+makedepends="cmd:bash clang$_llvmver llvm$_llvmver"
 source="wasi-libc-$_gitrev.tar.gz::https://github.com/WebAssembly/wasi-libc/archive/$_gitrev.tar.gz
 	no-double-build.patch
 	"

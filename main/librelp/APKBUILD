@@ -8,7 +8,7 @@ url="https://www.rsyslog.com"
 arch="all"
 license="GPL-3.0-or-later"
 makedepends="gnutls-dev openssl-dev>3"
-checkdepends="bash coreutils"
+checkdepends="cmd:bash coreutils"
 subpackages="$pkgname-static $pkgname-dev"
 source="https://download.rsyslog.com/librelp/librelp-$pkgver.tar.gz
 	implicit-decl.patch

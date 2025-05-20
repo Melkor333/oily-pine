@@ -8,7 +8,7 @@ arch="all"
 license="GPL-2.0-or-later OR LGPL-2.1-or-later OR MPL-1.1"
 subpackages="$pkgname-dev $pkgname-doc $pkgname-lang lib$pkgname:libs"
 makedepends="gettext-dev ncurses-dev readline-dev"
-checkdepends="bash"
+checkdepends="cmd:bash"
 source="https://github.com/hunspell/hunspell/releases/download/v$pkgver/hunspell-$pkgver.tar.gz"
 
 # secfixes:

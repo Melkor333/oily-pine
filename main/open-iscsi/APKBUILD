@@ -7,7 +7,7 @@ url="https://www.open-iscsi.com"
 arch="all"
 license="GPL-2.0-only"
 makedepends="kmod-dev libmount linux-headers openssl-dev>3
-	open-isns-dev util-linux-dev meson bash perl"
+	open-isns-dev util-linux-dev meson cmd:bash perl"
 options="!check"
 subpackages="$pkgname-dev $pkgname-libs $pkgname-doc $pkgname-openrc"
 install="$pkgname.post-install"

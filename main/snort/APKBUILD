@@ -12,7 +12,7 @@ url="https://www.snort.org/"
 # luajit
 arch="all !ppc64le !riscv64"
 license="GPL-2.0-only"
-depends="bash"
+depends="cmd:bash"
 makedepends="
 	bison
 	cmake

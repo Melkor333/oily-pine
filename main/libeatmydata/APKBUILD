@@ -7,7 +7,7 @@ pkgdesc="LD_PRELOAD library and utility that disables all forms of writing data 
 url="https://www.flamingspork.com/projects/libeatmydata/"
 arch="all"
 license="GPL-3.0-or-later"
-checkdepends="bash strace"
+checkdepends="cmd:bash strace"
 source="https://github.com/stewartsmith/libeatmydata/releases/download/v$pkgver/libeatmydata-$pkgver.tar.gz
 	lfs64.patch
 	"

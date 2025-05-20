@@ -17,7 +17,7 @@ license="GPL-2.0-or-later"
 options="!check" # No test suite
 depends="shorewall-core perl iproute2 perl-socket6"
 # coreutils for install -T
-makedepends="coreutils bash"
+makedepends="coreutils cmd:bash"
 subpackages="$pkgname-doc $pkgname-openrc"
 source="https://shorewall.org/pub/shorewall/$_maj_min/shorewall-$_maj_min_patch/shorewall6-$pkgver.tar.bz2
 	shorewall6.initd

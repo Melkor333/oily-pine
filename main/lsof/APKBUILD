@@ -7,7 +7,7 @@ url="https://github.com/lsof-org/lsof"
 arch="all"
 license="custom"
 subpackages="$pkgname-doc"
-makedepends="bash linux-headers perl"
+makedepends="cmd:bash linux-headers perl"
 source="https://github.com/lsof-org/lsof/archive/$pkgver/lsof-$pkgver.tar.gz
 	hassecurity.patch
 	"

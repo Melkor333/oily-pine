@@ -9,7 +9,7 @@ arch="all"
 license="LGPL-2.0-or-later"
 subpackages="$pkgname-devhelp $pkgname-dbg $pkgname-doc"
 depends="glib-dev"
-makedepends="libxslt-dev bash flex bison gobject-introspection-dev graphviz-dev"
+makedepends="libxslt-dev cmd:bash flex bison gobject-introspection-dev graphviz-dev"
 checkdepends="dbus-x11"
 source="https://download.gnome.org/sources/vala/${pkgver%.*}/vala-$pkgver.tar.xz
 	0001-posix-Define-_XOPEN_SOURCE-_GNU_SOURCE-for-signal-fu.patch

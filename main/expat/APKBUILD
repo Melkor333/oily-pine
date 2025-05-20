@@ -6,7 +6,7 @@ pkgdesc="XML Parser library written in C"
 url="https://libexpat.github.io/"
 arch="all"
 license="MIT"
-checkdepends="bash"
+checkdepends="cmd:bash"
 source="https://downloads.sourceforge.net/project/expat/expat/$pkgver/expat-$pkgver.tar.bz2"
 # pull in xmlwf for dev
 depends_dev="$pkgname=$pkgver-r$pkgrel"
