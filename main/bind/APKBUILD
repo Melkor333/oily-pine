@@ -24,7 +24,7 @@ _depends_plugins="$pkgname"
 _root_keys_upstream="dnssec-root"
 _depends_root_keys="$_root_keys_upstream"
 makedepends="
-	bash
+	cmd:bash
 	fstrm-dev
 	krb5-dev
 	libcap-dev

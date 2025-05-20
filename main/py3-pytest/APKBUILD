@@ -15,7 +15,7 @@ depends="
 	py3-pygments
 	"
 makedepends="py3-gpep517 py3-setuptools_scm py3-wheel"
-checkdepends="bash py3-hypothesis py3-virtualenv py3-xmlschema"
+checkdepends="cmd:bash py3-hypothesis py3-virtualenv py3-xmlschema"
 subpackages="$pkgname-pyc"
 source="https://files.pythonhosted.org/packages/source/p/pytest/pytest-$pkgver.tar.gz
 	"

@@ -7,7 +7,7 @@ pkgdesc="LiSt Open Files"
 url="https://github.com/lsof-org/lsof"
 arch="all"
 license="custom"
-makedepends="bash linux-headers perl"
+makedepends="cmd:bash linux-headers perl"
 subpackages="$pkgname-doc"
 source="https://github.com/lsof-org/lsof/archive/$pkgver/lsof-$pkgver.tar.gz
 	hassecurity.patch

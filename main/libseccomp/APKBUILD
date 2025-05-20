@@ -10,7 +10,7 @@ arch="all"
 license="LGPL-2.1-or-later"
 depends_dev="linux-headers"
 makedepends="$depends_dev gperf cython python3 python3-dev py3-setuptools autoconf automake libtool"
-checkdepends="bash"
+checkdepends="cmd:bash"
 subpackages="$pkgname-static $pkgname-dev $pkgname-doc py3-$pkgname:py3"
 source="https://github.com/seccomp/libseccomp/releases/download/v$pkgver/libseccomp-$pkgver.tar.gz
 	remove-redefinition-prctl.patch

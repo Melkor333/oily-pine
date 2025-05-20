@@ -7,7 +7,7 @@ pkgdesc="Userspace setup tool for transparent encryption of block devices using 
 url="https://gitlab.com/cryptsetup/cryptsetup"
 arch="all"
 license="GPL-2.0-or-later WITH cryptsetup-OpenSSL-exception"
-makedepends_build="asciidoctor bash coreutils"
+makedepends_build="asciidoctor cmd:bash coreutils"
 makedepends_host="
 	argon2-dev
 	json-c-dev

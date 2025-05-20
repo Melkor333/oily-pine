@@ -23,7 +23,7 @@ makedepends="
 	samurai
 	python3
 	"
-checkdepends="diffutils bash gtest-dev"
+checkdepends="diffutils cmd:bash gtest-dev"
 depends_dev="$pkgname=$pkgver-r$pkgrel"
 subpackages="
 	$pkgname-static

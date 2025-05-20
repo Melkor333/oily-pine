@@ -11,7 +11,7 @@ url="https://www.wireguard.com"
 # like the kernel.
 license="GPL-2.0-only"
 _wg_quick_deps="
-	bash
+	cmd:bash
 	cmd:resolvconf
 	iproute2
 	"

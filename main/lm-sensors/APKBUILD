@@ -10,7 +10,7 @@ provides="lm_sensors=$pkgver-r$pkgrel"
 options="!check"  # No test suite.
 license="LGPL-2.1-or-later AND GPL-2.0-or-later"  # libs are LGPL, binaries are GPL
 depends="sysfsutils"
-makedepends="bash perl rrdtool-dev bison flex"
+makedepends="cmd:bash perl rrdtool-dev bison flex"
 subpackages="
 	$pkgname-detect
 	$pkgname-dev
@@ -65,7 +65,7 @@ detect() {
 }
 
 fancontrol() {
-	depends="bash"
+	depends="cmd:bash"
 	pkgdesc="fancontrol daemon"
 	amove usr/sbin/fancontrol usr/sbin/pwmconfig
 }

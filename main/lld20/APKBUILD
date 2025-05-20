@@ -28,7 +28,7 @@ makedepends="
 	scudo-malloc
 	zlib-dev
 	"
-checkdepends="gtest-dev bash llvm$_llvmver-test-utils"
+checkdepends="gtest-dev cmd:bash llvm$_llvmver-test-utils"
 subpackages="$pkgname-dbg $pkgname-libs $pkgname-dev $pkgname-doc"
 source="https://github.com/llvm/llvm-project/releases/download/llvmorg-${pkgver//_/-}/lld-${pkgver//_/}.src.tar.xz
 	https://github.com/llvm/llvm-project/releases/download/llvmorg-${pkgver//_/-}/cmake-${pkgver//_/}.src.tar.xz

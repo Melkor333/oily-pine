@@ -22,7 +22,7 @@ depends_dev="
 	py3-packaging
 	"
 makedepends="$depends_dev
-	bash
+	cmd:bash
 	bison
 	flex
 	libffi-dev

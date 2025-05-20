@@ -24,7 +24,7 @@ makedepends_host="$depends_dev binutils-dev curl-dev libxml2-dev"
 makedepends_build="chrpath cmake python3 py3-setuptools samurai"
 # diffutils for diff: unrecognized option: strip-trailing-cr
 # coreutils for 'od' binary
-checkdepends="bash coreutils diffutils"
+checkdepends="cmd:bash coreutils diffutils"
 subpackages="
 	$pkgname-gtest:_gtest
 	$pkgname-static

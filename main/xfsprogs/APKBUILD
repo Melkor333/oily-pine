@@ -8,7 +8,7 @@ url="https://xfs.org/index.php/Main_Page"
 arch="all"
 license="LGPL-2.1-or-later"
 makedepends="
-	bash
+	cmd:bash
 	inih-dev
 	libedit-dev
 	linux-headers

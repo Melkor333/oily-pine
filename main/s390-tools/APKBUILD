@@ -7,7 +7,7 @@ url="https://github.com/ibm-s390-tools/s390-tools"
 arch="all"
 license="MIT"
 options="!check" # No test suite
-depends="bash"
+depends="cmd:bash"
 makedepends="linux-headers zlib-dev fuse3-dev ncurses-dev openssl-dev>3 libxml2-dev
 	cryptsetup-dev json-c-dev net-snmp-dev curl-dev liblockfile-dev"
 subpackages="$pkgname-doc"

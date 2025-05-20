@@ -11,7 +11,7 @@ license="GPL-3.0-or-later AND GPL-2.0-or-later AND GPL-2.0-only AND
 	GPL-1.0-only AND LGPL-2.1-or-later AND BSD-1-Clause AND
 	BSD-3-Clause AND BSD-4-Clause-UC AND MIT AND Public-Domain"
 checkdepends="findutils xz procps coreutils !uutils-coreutils"
-makedepends_build="bash"
+makedepends_build="cmd:bash"
 makedepends_host="
 	libcap-ng-dev
 	linux-headers

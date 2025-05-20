@@ -6,7 +6,7 @@ pkgdesc="Userspace helper for uvesafb that runs x86 code in an emulated environm
 url="https://github.com/mjanusz/v86d"
 arch="x86 x86_64"
 license="GPL-2.0-only"
-makedepends="bash linux-headers"
+makedepends="cmd:bash linux-headers"
 source="v86d-$pkgver.tar.gz::https://github.com/mjanusz/v86d/archive/v86d-$pkgver.tar.gz
 		modprobe.uvesafb
 		gcc14.patch

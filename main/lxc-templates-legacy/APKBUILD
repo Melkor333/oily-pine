@@ -7,7 +7,7 @@ pkgdesc="Legacy LXC container templates"
 url="https://linuxcontainers.org"
 arch="noarch"
 license="LGPL-2.1-or-later"
-depends="bash tar"
+depends="cmd:bash tar"
 subpackages="$pkgname-alpine"
 source="https://linuxcontainers.org/downloads/lxc/lxc-templates-$pkgver.tar.gz
 	0001-Update-alpine-keys-URI-fix-package-verification.patch

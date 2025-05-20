@@ -7,7 +7,7 @@ pkgdesc="Network-based RAID 1"
 url="https://www.drbd.org"
 arch="all"
 license="GPL-2.0-or-later"
-depends="bash"
+depends="cmd:bash"
 makedepends="
 	asciidoctor
 	bison

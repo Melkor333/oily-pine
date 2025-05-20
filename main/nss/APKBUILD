@@ -11,7 +11,7 @@ license="MPL-2.0"
 depends_dev="nspr-dev"
 makedepends="
 	$depends_dev
-	bash
+	cmd:bash
 	bsd-compat-headers
 	linux-headers
 	gyp

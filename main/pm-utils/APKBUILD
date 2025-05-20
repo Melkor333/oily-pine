@@ -10,7 +10,7 @@ options="!check"  # No test suite.
 license="GPL-2.0-only"
 # bash->usr/lib/pm-utils/sleep.d/98video-quirk-db-handler
 # kbd->usr/lib/pm-utils/sleep.d/99video
-depends="bash kbd"
+depends="cmd:bash kbd"
 makedepends="linux-headers"
 subpackages="$pkgname-dev $pkgname-doc"
 source="https://pm-utils.freedesktop.org/releases/pm-utils-$pkgver.tar.gz"

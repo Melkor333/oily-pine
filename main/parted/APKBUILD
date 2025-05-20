@@ -7,7 +7,7 @@ url="https://www.gnu.org/software/parted/parted.html"
 arch="all"
 license="GPL-3.0-or-later"
 makedepends="
-	bash
+	cmd:bash
 	lvm2-dev
 	ncurses-dev
 	readline-dev

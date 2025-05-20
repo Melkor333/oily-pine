@@ -8,7 +8,7 @@ url="https://www.freedesktop.org/wiki/Software/fontconfig"
 arch="all"
 license="MIT"
 makedepends="freetype-dev expat-dev python3-dev gperf util-linux-dev docbook2x"
-checkdepends="bash json-c-dev uuidgen curl"
+checkdepends="cmd:bash json-c-dev uuidgen curl"
 triggers="$pkgname.trigger=/usr/share/fonts/*"
 subpackages="$pkgname-static $pkgname-dev $pkgname-doc"
 source="https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/$pkgver/fontconfig-$pkgver.tar.xz

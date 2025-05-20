@@ -18,7 +18,7 @@ makedepends="
 	xxhash-dev
 	zstd-dev
 	"
-checkdepends="bash util-linux-misc python3"
+checkdepends="cmd:bash util-linux-misc python3"
 subpackages="$pkgname-doc"
 source="https://github.com/ccache/ccache/releases/download/v$pkgver/ccache-$pkgver.tar.xz
 	"

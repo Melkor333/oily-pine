@@ -12,7 +12,7 @@ arch="all"
 license="GPL-2.0-or-later"
 install="$pkgname.pre-install $pkgname.pre-upgrade"
 makedepends="asciidoctor libcap-dev texinfo nettle-dev gnutls-dev libseccomp-dev"
-checkdepends="bash"
+checkdepends="cmd:bash"
 subpackages="$pkgname-dbg $pkgname-doc $pkgname-openrc"
 source="https://chrony-project.org/releases/chrony-$pkgver.tar.gz
 	max_resolve_interval.patch

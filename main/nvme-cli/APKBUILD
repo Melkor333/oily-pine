@@ -8,7 +8,7 @@ arch="all"
 url="https://github.com/linux-nvme/nvme-cli"
 license="GPL-2.0-or-later"
 makedepends="
-	bash
+	cmd:bash
 	json-c-dev
 	libnvme-dev>=1.14
 	linux-headers

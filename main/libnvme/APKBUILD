@@ -13,7 +13,7 @@ depends_dev="
 	"
 makedepends="
 	$depends_dev
-	bash
+	cmd:bash
 	dbus-dev
 	meson
 	python3-dev

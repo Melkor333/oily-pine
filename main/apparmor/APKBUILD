@@ -10,7 +10,7 @@ license="GPL-2.0-or-later"
 makedepends="
 	autoconf
 	automake
-	bash
+	cmd:bash
 	bison
 	findutils
 	flex
@@ -158,7 +158,7 @@ _perl_apparmor() {
 
 _apparmor_utils() {
 	pkgdesc="AppArmor userspace utilities"
-	depends="py3-apparmor libapparmor=$pkgver-r$pkgrel perl python3 bash"
+	depends="py3-apparmor libapparmor=$pkgver-r$pkgrel perl python3 cmd:bash"
 
 	amove etc/apparmor/easyprof.conf
 	amove etc/apparmor/logprof.conf

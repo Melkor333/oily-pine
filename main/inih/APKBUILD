@@ -9,7 +9,7 @@ url="https://github.com/benhoyt/inih"
 arch="all"
 license="BSD-3-Clause"
 makedepends="meson"
-checkdepends="bash"
+checkdepends="cmd:bash"
 subpackages="
 	$pkgname-dev:_dev
 	$pkgname-inireader
