@@ -23,6 +23,7 @@ There are 2 ways to build packages:
 `./build-container.sh` sets up an alpine container with a build user and installs Oils to /bin/sh and /bin/bash.
 - It does a "dirty install" of a newer version of Oils. This means the installed oils comes from [install-dirty-oils.sh](./container/install-dirty-oils.sh).
 - It sets up a build user, etc. to make sure building packages works
+
 `./build-packages.sh` runs the container and builds all packages
 - with the following 4 mount points and build packages:
     - ../ -> The package sources (/home/packager/aports)
