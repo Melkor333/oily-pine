@@ -7,7 +7,12 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 	cd "$SCRIPT_DIR/.."
 CONTAINER="oily-pine-builder"
 RUNTIME=$(command -v podman || command -v docker)
+echo "using '$RUNTIME'"
 MOUNTPOINTS="-v ./:/home/packager/aports -v ./oily/abuild:/home/packager/.abuild -v ./oily/logs:/home/packager/logs -v ./oily/packages:/home/packager/packages"
+RUN_ARGS="--rm"
+if [[ "$RUNTIME" =~ .*"podman" ]]; then
+  RUN_ARGS="$RUN_ARGS --userns=keep-id"
+fi
 
 
 build() {
@@ -15,21 +20,21 @@ build() {
     sed -i "s|^wget .*|wget $1|" oily/container/install-dirty-oils.sh
   fi
 
-  $RUNTIME build oily/container/ -t $CONTAINER
+  $RUNTIME build --network=host oily/container/ -t $CONTAINER
 }
 
 package() {
   if test -z "$1"; then
-    $RUNTIME run --rm $MOUNTPOINTS $CONTAINER $@ |& tee -a oily/logs/$(date +%y-%m-%d_%H:%M)-buildrepo.log
+    $RUNTIME run $RUN_ARGS $MOUNTPOINTS $CONTAINER $@ |& tee -a oily/logs/$(date +%y-%m-%d_%H:%M)-buildrepo.log
   else
-    $RUNTIME run --rm $MOUNTPOINTS --entrypoint /usr/bin/ysh $CONTAINER \
+    $RUNTIME run $RUN_ARGS $MOUNTPOINTS --entrypoint /usr/bin/ysh $CONTAINER \
     -c "/home/packager/aports/oily/setup-key.sh; abuild -rC 'aports/$1'"
   fi
 }
 
 hack() {
   echo "once in the container, run /home/packager/aports/oily/setup-key.sh before packaging"
-  $RUNTIME run --rm -ti $MOUNTPOINTS --entrypoint /usr/bin/ysh $CONTAINER $@
+  $RUNTIME run $RUN_ARGS -ti $MOUNTPOINTS --entrypoint /usr/bin/ysh $CONTAINER $@
 }
 
 usage() {
