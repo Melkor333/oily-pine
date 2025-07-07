@@ -11,7 +11,7 @@ echo "using '$RUNTIME'"
 MOUNTPOINTS="-v ./:/home/packager/aports -v ./oily/abuild:/home/packager/.abuild -v ./oily/logs:/home/packager/logs -v ./oily/packages:/home/packager/packages"
 RUN_ARGS="--rm"
 if [[ "$RUNTIME" =~ .*"podman" ]]; then
-  RUN_ARGS="$RUN_ARGS --userns=keep-id"
+  RUN_ARGS="$RUN_ARGS --userns=keep-id:uid=1000,gid=1000"
 fi
 
 
