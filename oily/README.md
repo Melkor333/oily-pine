@@ -4,12 +4,10 @@ Building all alpine packages with oils-for-unix instead of busybox ash or bash.
 
 This should work with either `podman` or `docker`.
 
-*Warning: For now `--usermode=keep-id` is not configured in the scripts, so the container might change the permissions of local files!*
-
 ## How to build packages
 
 There are 2 ways to build packages:
-- Using a Container
+- Using a `container`
     - Works without a dedicated machine
     - Very easy to set up and hack
     - Sadly for some reason automated builds with `buildrepo` fail with unknown errors like `C compiler can't create executables`
@@ -40,6 +38,33 @@ Use the script `./container.sh`.
 - Use this to build a single package: `cd ~/aports/main/bash && abuild -r`
 
 `./find-broken.sh` Finds `src` directories of unfinished package builds which are most certainly failed builds. Currently running builds will also be displayed.
+
+### Rootbld
+
+The `rootbld.sh` script expects to be run on an alpine linux vm. This repository must be cloned into the vm.
+
+`rootbld.sh oils URL` takes an URL to an oils tarball and creates an `oils-for-unix.apk` binary package from this binary.
+To do that it does:
+- download the URL tarball
+- extract it
+- rename the src folder to match ~/aports/testing/oils-for-unix
+- cd to ~/aports/testing/oils-foe-unix
+- run `abuild build` to compile the extracted source
+- remove preexisting oils-for-unix packages
+- run `abuild package rootpkg index` which creates an `apk` of the built binary
+Why? a CI tarball looks slightly different to a release tarball (tar /tar.gz and oils-for-unix-WRONGVERSION). The above circumvents that.
+
+`rootbld.sh package [PACKAGE]` uses runs a modified `abuild roorbld` which uses the previously built `oils-for-unix.apk` as part of the rootbld base.
+
+TODO: currently doesn't use abuild-oils! Also untested :)
+`rootbld.sh buildrepo` builds a whole repo using `buildrepo`
+
+### abuild-oils and buildrepo-oils
+
+`abuild` has some hardcoded packages it installs into a `rootbld` as a base. `abuild-oils` is a patched version which also installs `oils-for-unix` and `oils-for-binsh` into the chroot.
+
+`buildrepo-oils` just uses `abuild-oils` instead of `abuild`.
+
 
 ## Bash Dependencies
 

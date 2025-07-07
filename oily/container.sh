@@ -4,9 +4,9 @@ set -eo pipefail
 
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-	cd "$SCRIPT_DIR/.."
+cd "$SCRIPT_DIR/.."
 CONTAINER="oily-pine-builder"
-RUNTIME=$(command -v podman || command -v docker)
+RUNTIME=$(command -v podman || command -v docker || { echo 'need docker or podman' >&2 ; exit 1; })
 echo "using '$RUNTIME'"
 MOUNTPOINTS="-v ./:/home/packager/aports -v ./oily/abuild:/home/packager/.abuild -v ./oily/logs:/home/packager/logs -v ./oily/packages:/home/packager/packages"
 RUN_ARGS="--rm"
