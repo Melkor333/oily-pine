@@ -1,0 +1,3055 @@
+#!/bin/ash -e
+# vim: set filetype=sh:
+
+# abuild - build apk packages (light version of makepkg)
+# Copyright (c) 2008-2015 Natanael Copa <ncopa@alpinelinux.org>
+# Copyright (c) 2016 Timo Teräs <timo.teras@iki.fi>
+#
+# Distributed under GPL-2.0-only
+#
+
+program_version=3.15.0_rc3-r3
+sharedir=${ABUILD_SHAREDIR:-/usr/share/abuild}
+
+abuild_path=$(readlink -f $0)
+
+: ${git:=$(command -v git || echo true)}
+export git
+
+if ! [ -f "$sharedir/functions.sh" ]; then
+	echo "$sharedir/functions.sh: not found" >&2
+	exit 1
+fi
+. "$sharedir/functions.sh"
+
+# defaults
+: ${FAKEROOT:="fakeroot"}
+: ${SUDO_APK:="abuild-apk"}
+: ${APK:="apk"}
+: ${ADDUSER:="abuild-adduser"}
+: ${ADDGROUP:="abuild-addgroup"}
+
+apk_opt_wait="--wait 30"
+doc_threshold=$((2 * 1024 * 1024)) # 2 MiB
+
+umask 022
+
+shell_escape() {
+	printf '%s\n' "'${1//\'/\'\\\'\'}'"
+}
+
+# run optional log command for remote logging
+logcmd() {
+	${ABUILD_LOG_CMD:-true} "$@"
+	return 0
+}
+
+# we override the default msg, warning and error as we want the pkgname
+msg() {
+	[ -n "$quiet" ] && return 0
+	local prompt="$GREEN>>>${NORMAL}"
+	local fake="${FAKEROOTKEY:+${BLUE}*${NORMAL}}"
+	local name="${STRONG}${subpkgname:-$pkgname}${NORMAL}"
+	printf "${prompt} ${name}${fake}: %s\n" "$1" >&2
+}
+
+warning() {
+	local prompt="${YELLOW}>>> WARNING:${NORMAL}"
+	local fake="${FAKEROOTKEY:+${BLUE}*${NORMAL}}"
+	local name="${STRONG}${subpkgname:-$pkgname}${NORMAL}"
+	printf "${prompt} ${name}${fake}: %s\n" "$1" >&2
+}
+
+error() {
+	local prompt="${RED}>>> ERROR:${NORMAL}"
+	local fake="${FAKEROOTKEY:+${BLUE}*${NORMAL}}"
+	local name="${STRONG}${subpkgname:-$pkgname}${NORMAL}"
+	printf "${prompt} ${name}${fake}: %s\n" "$1" >&2
+	logcmd "ERROR: $pkgname: $1"
+}
+
+amove() {
+	[ -n "$subpkgdir" ] || return 1
+
+	local olddir="$(pwd -L)"
+	cd "$pkgdir"
+
+	local ret=0 IFS="" pattern f d
+	for pattern; do
+		for f in ${pattern#"${pattern%%[!/]*}"}; do # let shell expand the pattern
+			[ -L "$f" ] || [ -e "$f" ] || {
+				ret=1
+				continue
+			}
+			# strip all trailing /
+			f=${f%"${f##*[!/]}"}
+			d=${f%/*}
+			[ "$d" = "$f" ] && d=.
+			mkdir -p "$subpkgdir/$d"
+			mv -v "$f" "$subpkgdir/$d"
+			rmdir -p "$d" 2>/dev/null || :
+		done
+	done
+
+	cd "$olddir"
+	return $ret
+}
+
+cross_creating() {
+	test "$CHOST" != "$CTARGET"
+}
+
+cross_compiling() {
+	test "$CBUILD" != "$CHOST"
+}
+
+want_check() {
+	[ -n "$ABUILD_BOOTSTRAP" ] && return 1
+	cross_compiling && return 1
+	options_has "!check" && return 1
+	return 0
+}
+
+set_source_date() {
+	# dont error out if APKBUILD is not in git
+	if ! $git rev-parse --show-toplevel >/dev/null 2>&1; then
+		git=true
+	fi
+	# set time stamp for reproducible builds
+	if [ -z "$ABUILD_LAST_COMMIT" ]; then
+		ABUILD_LAST_COMMIT="$(git_last_commit)$(git_dirty)"
+	fi
+	if [ -z "$SOURCE_DATE_EPOCH" ] && [ "${ABUILD_LAST_COMMIT%-dirty}" = "$ABUILD_LAST_COMMIT" ]; then
+		SOURCE_DATE_EPOCH=$(git_last_commit_epoch $ABUILD_LAST_COMMIT)
+	fi
+	if [ -z "$SOURCE_DATE_EPOCH" ]; then
+		SOURCE_DATE_EPOCH=$(stat -c "%Y" "$APKBUILD")
+	fi
+	export SOURCE_DATE_EPOCH ABUILD_LAST_COMMIT
+}
+
+default_cleanup_srcdir() {
+	if options_has "chmod-clean" && test -d "$srcdir"; then
+		chmod -R +w "$srcdir"
+	fi
+	rm -rf "$srcdir"
+}
+
+cleanup_srcdir() {
+	default_cleanup_srcdir
+}
+
+cleanup() {
+	local i=
+	[ -z "$subpkgdir" ] && set_xterm_title ""
+	if [ -n "$keep_build" ]; then
+		return 0
+	fi
+	for i; do
+		case $i in
+		bldroot)
+			if [ "$BUILD_ROOT" ]; then
+				msg "Cleaning up build chroot"
+				abuild-rmtemp "$BUILD_ROOT"
+			fi;;
+		pkgdir) msg "Cleaning up pkgdir"; rm -rf "$pkgbasedir";;
+		srcdir) msg "Cleaning up srcdir"; cleanup_srcdir;;
+		tmpdir) msg "Cleaning up tmpdir"; rm -rf "$tmpdir";;
+		deps)
+			if [ -n "$uninstall_after" ]; then
+				msg "Uninstalling dependencies..."
+				undeps
+			fi
+			;;
+		esac
+	done
+}
+
+die() {
+	trap - EXIT
+	error "$@"
+	cleanup $ERROR_CLEANUP
+	exit 1
+}
+
+spell_error() {
+	die "APKBUILD contains '$1'. It should be '$2'"
+}
+
+verify_pkgname() {
+	case $1 in
+		''|*[!a-zA-Z0-9._+-]*|[!a-zA-Z0-9]*) return 1;;
+	esac
+	return 0
+}
+
+# check if apkbuild is valid
+default_validate() {
+	local i= j=
+	msg "Validating $APKBUILD..."
+	[ -z "$pkgver" ] && die "Missing pkgver in APKBUILD"
+	$APK version --check --quiet -- "$pkgver"-r0 || \
+		die "$pkgver is not a valid version"
+	[ -z "$pkgrel" ] && die "Missing pkgrel in APKBUILD"
+	# give 0 as it is always valid and give the pkgrel
+	$APK version --check --quiet 0-r"$pkgrel" || \
+		die "$pkgrel is not a valid pkgrel"
+	# digit+letter+digit passes the apk2 version check
+	case $pkgver in
+		*[0-9][a-z][0-9]*)
+			die "the digit+letter+digit version format is invalid. Use suffixes instead"
+			;;
+	esac
+
+	[ -z "$pkgdesc" ] && die "Missing pkgdesc in APKBUILD"
+	[ -z "$url" ] && die "Missing url in APKBUILD"
+	[ -z "$license" ] && die "Missing license in APKBUILD"
+	if [ $(echo "$pkgdesc" | wc -c) -gt 128 ]; then
+		die "pkgdesc is too long"
+	fi
+	if [ $(echo "$pkgdesc" | wc -l) -gt 1 ]; then
+		die "pkgdesc is not a single line"
+	fi
+	is_function package || die "Missing package() function in APKBUILD"
+
+	case "$replaces_priority" in
+		*[!0-9]*) die "replaces_priority must be a number" ;;
+	esac
+
+	case "$provider_priority" in
+		*[!0-9]*) die "provider_priority must be a number" ;;
+	esac
+
+	# check pkgname and subpkgnames
+	for i in "$pkgname" $subpackages; do
+		i="${i%%:*}"
+		verify_pkgname "$i" || die "$i is not a valid package name"
+		local found=
+		for j in "$pkgname" $subpackages; do
+			j="${j%%:*}"
+			[ "$j" = "$i" ] || continue
+			[ -n "$found" ] && die "duplicate (sub-)package named $i"
+			found=1
+		done
+	done
+
+	# check dependencies
+	for i in $depends $makedepends; do
+		check_depver "$i" || return 1
+	done
+
+	for i in $install; do
+		local n=${i%.*}
+		local suff=${i##*.}
+		case "$suff" in
+		pre-install|post-install|pre-upgrade|post-upgrade|pre-deinstall|post-deinstall);;
+		*) die "$i: unknown install script suffix"
+		esac
+		if ! subpackages_has "$n" && [ "$n" != "$pkgname" ]; then
+			die "$i: install script does not match pkgname or any subpackage"
+		fi
+		[ -e "$startdir/$i" ] || die "install script $i is missing"
+		for j in chown chmod chgrp; do
+			if grep -q $j "$startdir"/$i; then
+				warning "$i: found $j"
+				warning2 "Permissions should be fixed in APKBUILD package()"
+			fi
+		done
+	done
+
+	for i in $triggers; do
+		local f=${i%=*}
+		local p=${f%.trigger}
+		[ "$f" = "$i" ] && die "$f: triggers must contain '='"
+		[ "$p" = "$f" ] && die "$f: triggers scripts must have .trigger suffix"
+		if ! subpackages_has "$p" && [ "$p" != "$pkgname" ]; then
+			die "$p: trigger script does not match pkgname or any subpackage"
+		fi
+
+		if source_has "$f"; then
+			warning "You should not have \$triggers in source"
+			continue
+		fi
+
+		[ -e "$startdir"/$f ] || die "trigger script $f is missing"
+	done
+	for i in $source; do
+		if install_has "$i"; then
+			warning "You should not have \$install in source"
+			continue
+		fi
+		case "$i" in
+			*::*) i=${i%%::*};;
+			https://*) makedepends_has wget && warning "wget no longer need to be in makedepends when source has https://" ;;
+		esac
+		list_has ${i##*/} $sha256sums $sha512sums \
+			|| die "${i##*/} is missing in checksums"
+
+		# verify that our source does not have git tag version
+		# name as tarball (typically github)
+		if is_remote "$i" && [ "${i#*::}" = "$i" ]; then
+			case ${i##*/} in
+			v$pkgver.tar.*|$pkgver.tar.*)
+				die "source ${i##*/} needs to be renamed to avoid possible collisions"
+				;;
+			esac
+		fi
+	done
+
+	# verify that things listed in checksum also is listed in source
+	local algo=
+	for algo in sha256 sha512; do
+		eval set -- \$${algo}sums
+		while [ $# -gt 1 ]; do
+			local file="$2"
+			shift 2
+			source_has $file || die "$file exists in ${algo}sums but is missing in \$source"
+		done
+	done
+
+	# common spelling errors
+	[ -n "$depend" ] && spell_error depend depends
+	[ -n "$makedepend" ] && spell_error makedepend makedepends
+	[ -n "$pkguser" ] && spell_error pkguser pkgusers
+	[ -n "$pkggroup" ] && spell_error pkggroup pkggroups
+	[ -n "$subpackage" ] && spell_error subpackage subpackages
+	[ -n "$checkdepend" ] && spell_error checkdepend checkdepends
+	[ -n "$conflicts" ] && die "APKBUILD contains \$conflicts. Explicit conflicts should be added as '!pkgname' to depends"
+
+	check_maintainer || die "Provide a valid RFC822 maintainer address"
+	[ $(grep '^# *Maintainer:' "$APKBUILD" | wc -l) -gt 1 ] \
+		&& die "More than one maintainer"
+	check_license || warning "Please use valid SPDX license identifiers found at: https://spdx.org/licenses"
+
+	check_depends_dev || warning "depends_dev found but no development subpackage found"
+	check_secfixes_comment || return 1
+
+	makedepends_has 'g++' && ! options_has toolchain && warning "g++ should not be in makedepends"
+	if makedepends_has 'go' && ! options_has 'net'; then
+		warning "Go packages require network connection to build. Maybe add 'net' to options"
+	fi
+
+	if ! options_has "!check" && [ -n "$REQUIRE_CHECK" ]; then
+		(unset check; . "$APKBUILD"; type check >/dev/null 2>&1) || \
+			die "Testsuites (abuild check) are required or need to be explicitly disabled!"
+	fi
+
+	check_provides || die "provides must not contain $pkgname"
+
+	return 0
+}
+
+validate() {
+	default_validate
+}
+
+# for backwards compat
+sanitycheck() {
+	warning "'sanitycheck' is renamed. Use 'validate' instead."
+}
+
+sumcheck() {
+	local algo="$1" sums="$2"
+	local f endreturnval origin csum file
+
+	# get number of checksums
+	set -- $sums
+	local numsums=$(( $# / 2 ))
+
+	set -- $source
+	if [ $# -ne $numsums ]; then
+		die "Number of ${algo}sums($numsums) does not correspond to number of sources($#)"
+	fi
+	fetch || return 1
+	msg "Checking ${algo}sums..."
+	cd "$srcdir" || return 1
+	local IFS=$'\n'
+	endreturnval=0
+	for src in $sums; do
+		origin=$1; shift
+		if ! echo "$src" | ${algo}sum -c; then
+			endreturnval=1
+			is_remote $origin || continue
+
+			csum="${src:0:8}"
+			file="$SRCDEST/$(filename_from_uri $origin)"
+
+			echo "Because the remote file above failed the ${algo}sum check it will be renamed."
+			echo "Rebuilding will cause it to re-download which in some cases may fix the problem."
+			echo "Renaming: ${file##*/} to ${file##*/}.$csum"
+			mv "$file" "$file.$csum"
+		fi
+	done
+	return $endreturnval
+}
+
+# verify checksums
+verify() {
+	local verified=false algo=
+	for algo in sha512 sha256; do
+		local sums=
+		eval sums=\"\$${algo}sums\"
+		if [ -z "$sums" ] || [ -z "$source" ]; then
+			continue
+		fi
+		sumcheck "$algo" "$sums" || return 1
+		verified=true
+		break
+	done
+	if [ -n "$source" ] && ! $verified; then
+		die "Use 'abuild checksum' to generate/update the checksum(s)"
+	fi
+	return 0
+}
+
+# verify upstream sources
+sourcecheck() {
+	local uri
+	for uri in $source; do
+		is_remote $uri || continue
+		case "$uri" in
+		*::*)
+			uri=${uri##*::}
+			;;
+		esac
+		wget --spider -q "$uri" || return 1
+	done
+	return 0
+}
+
+uri_fetch() {
+	local uri="$1"
+	mkdir -p "$SRCDEST"
+	msg "Fetching $uri"
+	abuild-fetch -d "$SRCDEST" "$uri"
+}
+
+is_remote() {
+	case "${1#*::}" in
+		http://*|ftp://*|https://*)
+			return 0;;
+	esac
+	return 1
+}
+
+filename_from_uri() {
+	local uri="$1"
+	local filename="${uri##*/}"  # $(basename $uri)
+	case "$uri" in
+	*::*) filename=${uri%%::*};;
+	esac
+	echo "$filename"
+}
+
+# try download from file from mirror first
+uri_fetch_mirror() {
+	local uri="$1"
+	if [ -n "$DISTFILES_MIRROR" ]; then
+		if is_remote "$DISTFILES_MIRROR"; then
+			uri_fetch "$DISTFILES_MIRROR"/$(filename_from_uri $uri)\
+				&& return 0
+		else
+			cp "$DISTFILES_MIRROR"/$(filename_from_uri $uri) \
+				"$SRCDEST" && return 0
+		fi
+	fi
+	uri_fetch "$uri"
+}
+
+symlinksrc() {
+	local s
+	mkdir -p "$srcdir"
+	for s in $source; do
+		if is_remote "$s"; then
+			ln -sf "$SRCDEST/$(filename_from_uri $s)" "$srcdir"/
+		else
+			ln -sf "$startdir/$s" "$srcdir/"
+		fi
+	done
+}
+
+default_fetch() {
+	local s
+	mkdir -p "$srcdir"
+	for s in $source; do
+		if is_remote "$s"; then
+			uri_fetch_mirror "$s" || return 1
+			ln -sf "$SRCDEST/$(filename_from_uri $s)" "$srcdir"/
+		else
+			ln -sf "$startdir/$s" "$srcdir/"
+		fi
+	done
+}
+
+fetch() {
+	default_fetch
+}
+
+# verify that all init.d scripts are openrc runscripts
+initdcheck() {
+	local i line
+	for i in $source; do
+		case $i in
+		*.initd)
+			line=$(head -n 1 "$srcdir"/"$(filename_from_uri $i)")
+			;;
+		*) continue ;;
+		esac
+
+		case "$line" in
+		*sbin/openrc-run)
+			;;
+		*sbin/runscript)
+			warning "$i is not an openrc #!/sbin/openrc-run"
+			;;
+		*)	error "$i is not an openrc #!/sbin/openrc-run"
+			return 1
+			;;
+		esac
+	done
+}
+
+# unpack the sources
+default_unpack() {
+	local u gunzip
+	verify || return 1
+	initdcheck || return 1
+	mkdir -p "$srcdir"
+	gunzip=$(command -v unpigz || echo gunzip)
+	for u in $source; do
+		local s
+		if is_remote "$u"; then
+			s="$SRCDEST/$(filename_from_uri $u)"
+		else
+			s="$startdir/$u"
+		fi
+		case "$s" in
+			*.tar)
+				msg "Unpacking $s..."
+				tar -C "$srcdir" -xf "$s" || return 1;;
+			*.tar.gz|*.tgz)
+				msg "Unpacking $s..."
+				$gunzip -c "$s" | tar -C "$srcdir" -x || return 1;;
+			*.tar.bz2)
+				msg "Unpacking $s..."
+				tar -C "$srcdir" -jxf "$s" || return 1;;
+			*.tar.lz)
+				msg "Unpacking $s..."
+				tar -C "$srcdir" --lzip -xf "$s" || return 1;;
+			*.tar.lzma)
+				msg "Unpacking $s..."
+				unlzma -c "$s" | tar -C "$srcdir" -x  \
+					|| return 1;;
+			*.tar.xz)
+				msg "Unpacking $s..."
+				unxz -c "$s" | tar -C "$srcdir" -x || return 1;;
+			*.tar.zst)
+				msg "Unpacking $s..."
+				tar -C "$srcdir" --zstd -xf "$s" || return 1;;
+			*.zip)
+				msg "Unpacking $s..."
+				unzip -n -q "$s" -d "$srcdir" || return 1;;
+		esac
+	done
+}
+
+unpack() {
+	default_unpack
+}
+
+# cleanup source, package and temporary dir
+clean() {
+	cleanup srcdir
+	cleanup pkgdir
+	cleanup tmpdir
+}
+
+# cleanup fetched sources
+cleancache() {
+	local s
+	for s in $source; do
+		if is_remote "$s"; then
+			s=$(filename_from_uri $s)
+			msg "Cleaning downloaded $s ..."
+			rm -f "$SRCDEST/$s"
+		fi
+	done
+}
+
+subpkg_unset() {
+	unset subpkgname subpkgsplit subpkgarch
+}
+
+subpkg_set() {
+	subpkgname=${1%%:*}
+
+	local _splitarch=${1#*:}
+	[ "$_splitarch" = "$1" ] && _splitarch=""
+
+	subpkgsplit=${_splitarch%%:*}
+
+	if [ -z "$subpkgsplit" ]; then
+		case $subpkgname in
+			*-bash-completion) subpkgsplit=bashcomp ;;
+			*-zsh-completion) subpkgsplit=zshcomp ;;
+			*-fish-completion) subpkgsplit=fishcomp ;;
+			*) subpkgsplit="${subpkgname##*-}" ;;
+		esac
+	fi
+
+	subpkgarch=${_splitarch#*:}
+	if [ "$subpkgarch" = "$_splitarch" -o -z "$subpkgarch" ]; then
+		case "$subpkgname" in
+		*-doc | *-openrc | *-lang | *sh-completion | *-pyc) subpkgarch="noarch" ;;
+		*) subpkgarch="$pkgarch" ;;
+		esac
+	elif [ "$subpkgarch" = "all" ]; then
+		subpkgarch=$CARCH
+	fi
+}
+
+arch2dir() {
+	local arch="$1"
+	[ "$arch" = "noarch" ] && arch="$CARCH"
+	printf '%s\n' "$arch"
+}
+
+cleanpkg() {
+	local i
+	msg "Cleaning built packages..."
+	rm -f "$REPODEST/$repo/src/$pkgname-$pkgver-r$pkgrel.src.tar.gz"
+	for i in $allpackages; do
+		subpkg_set "$i"
+		rm -f "$REPODEST/$repo/$(arch2dir "$subpkgarch")/$subpkgname-$pkgver-r$pkgrel.apk"
+	done
+	subpkg_unset
+
+	# remove given packages from index
+	update_abuildrepo_index
+}
+
+# clean all packages except current
+cleanoldpkg() {
+	local i j
+	msg "Cleaning all packages except $pkgver-r$pkgrel..."
+	for i in $allpackages; do
+		subpkg_set "$i"
+		for j in "$REPODEST"/$repo/$CARCH/$subpkgname-[0-9]*.apk ; do
+			[ "${j##*/}" = "$subpkgname-$pkgver-r$pkgrel.apk" ] \
+				&& continue
+			rm -f "$j"
+		done
+	done
+	subpkg_unset
+	update_abuildrepo_index
+	return 0
+}
+
+mkusers() {
+	local i
+	for i in $pkggroups; do
+		if ! getent group $i >/dev/null; then
+			msg "Creating group $i"
+			$ADDGROUP -S $i || return 1
+		fi
+	done
+	for i in $pkgusers; do
+		if ! getent passwd $i >/dev/null; then
+			local gopt=
+			msg "Creating user $i"
+			if getent group $i >/dev/null; then
+				gopt="-G $i"
+			fi
+			$ADDUSER -S -D -H $gopt $i || return 1
+		fi
+	done
+}
+
+# helper to update config.sub to a recent version
+update_config_sub() {
+	find . -name config.sub | (local changed=false; while read f; do
+		if ! ./$f loongarch64-alpine-linux-musl 2>/dev/null; then
+			msg "Updating $f"
+			cp "$sharedir"/${f##*/} "$f" || return 1
+			changed=true
+		else
+			msg "No update needed for $f"
+		fi
+	done; $changed)
+}
+
+# helper to update config.guess to a recent version
+update_config_guess() {
+	find . -name config.guess | (local changed=false; while read f; do
+		if grep -q aarch64 "$f" && grep -q ppc64le "$f" && grep -q riscv64 "$f" && grep -q loongarch64 "$f"; then
+			msg "No update needed for $f"
+		else
+			msg "Updating $f"
+			cp "$sharedir"/${f##*/} "$f" || return 1
+			changed=true
+		fi
+	done; $changed)
+}
+
+runpart() {
+	local part=$1
+	[ -n "$DEBUG" ] && msg "$part"
+	trap "die '$part failed'" EXIT
+	if [ -d "$builddir" ]; then
+		case "$part" in
+			prepare|build|package|check)
+				# exclude aports from git repo discovery
+				export GIT_CEILING_DIRECTORIES="$startdir"
+
+				# prevent using global cache directories
+				if [ -n "$MOVE_CACHES" ]; then
+					export GOCACHE="${GOCACHE:-"$tmpdir/go"}"
+					export GOMODCACHE="${GOCACHE:-"$tmpdir/gomod"}"
+					export GOTMPDIR="${GOTMPDIR:-"$tmpdir"}"
+					# https://github.com/golang/go/issues/32320
+					mkdir -p "$GOTMPDIR"
+					export CARGO_HOME="${CARGO_HOME:-"$tmpdir/cargo"}"
+				fi
+
+				cd "$builddir"
+				;;
+		esac
+	fi
+	$part
+	trap - EXIT
+}
+
+have_patches() {
+	local i
+	for i in $source; do
+		case ${i%::*} in
+			*.patch|*.patch.gz|*.patch.xz) return 0;;
+		esac
+	done
+	return 1
+}
+
+default_prepare() {
+	local i failed=
+	[ -n "$builddir" -a -d "$builddir" ] && cd "$builddir"
+	if ! have_patches; then
+		return 0
+	fi
+	[ -d "$builddir" ] || { error "Is \$builddir set correctly?"; return 1; }
+	for i in $source; do
+		case ${i%::*} in
+			*.patch)
+				msg "${i%::*}"
+				patch ${patch_args:--p1} -i "$srcdir/$(filename_from_uri $i)" || failed="$failed $i"
+				;;
+			*.patch.gz)
+				msg "${i%::*}"
+				gunzip -c "$srcdir/$(filename_from_uri $i)" | patch ${patch_args:--p1} || failed="$failed $i"
+				;;
+			*.patch.xz)
+				msg "${i%::*}"
+				unxz -c "$srcdir/$(filename_from_uri $i)" | patch ${patch_args:--p1} || failed="$failed $i"
+				;;
+		esac
+	done
+	if [ -z "$failed" ]; then
+		return 0
+	fi
+	error "The following patches failed to apply:"
+	for i in $failed; do
+		printf "  %s\n" "$i" >&2
+	done
+	return 1
+}
+
+prepare() {
+	default_prepare
+}
+
+build() {
+	:
+}
+
+# generate a simple tar.gz package of pkgdir
+targz() {
+	cd "$pkgdir" || return 1
+	mkdir -p "$REPODEST"/src
+	tar -czf "$REPODEST"/src/$pkgname-$pkgver-r$pkgrel.tar.gz *
+}
+
+postcheck() {
+	local dir="$1" name="$2" i= j= e=0
+	msg "Running postcheck for $name"
+	# checking for FHS compat
+	if ! options_has "!fhs"; then
+		for i in srv usr/local opt tmp var/tmp var/lock var/empty home sys proc mnt dev; do
+			for j in "$dir"/"$i"/* "$dir"/"$i"/.[!.]* "$dir"/"$i"/..?*; do
+				if [ -L "$j" ] || [ -e "$j" ]; then
+					error "Packages must not put anything under /$i"
+					e=1
+					break
+				fi
+			done
+		done
+		if [ -d "$dir"/usr/var ]; then
+			error "Found /usr/var, localstatedir is most likely wrong"
+			e=1
+		fi
+	fi
+
+	# Alpine Linux as a musl libc distro does not use /lib64 or /usr/lib64 under
+	# any circumstance, packages installing to it are 100% sure a packaging error
+	# except when we are doing GNU Libc compatibility which should be rare enough
+	# to warrant a lib64 check
+	if ! options_has "lib64"; then
+		if [ -e "$dir"/lib64 ]; then
+			error "Packages must not put anything under /lib64, use /usr/lib instead"
+			e=1
+		elif [ -e "$dir"/usr/lib64 ]; then
+			error "Packages must not put anything under /usr/lib64, use /usr/lib instead"
+			e=1
+		fi
+	fi
+
+	# /usr merge
+	if ! options_has "!usrmerge"; then
+		for i in bin sbin lib; do
+			if [ -L "$dir"/$i ] || [ -e "$dir"/$i ]; then
+				warning "Packages must not put anything under /$i, use /usr/${i##*s} instead"
+			fi
+		done
+	fi
+
+	# remove *.la files if libtool is not set
+	if ! options_has "libtool"; then
+		find "$dir" -name '*.la' -type f -delete
+	fi
+
+	# look for /usr/lib/charset.alias
+	if [ -e "$dir"/usr/lib/charset.alias ] \
+			&& ! options_has "charset.alias"; then
+		error "Found /usr/lib/charset.alias"
+		e=1
+	fi
+	# look for /etc/init.d and /etc/conf.d
+	if [ -e "$dir"/etc/init.d -o -e "$dir"/etc/conf.d ] \
+			&& ! is_openrc_pkg "$name"; then
+		warning "Found OpenRC directory (/etc/conf.d or /etc/init.d) but name doesn't end with -openrc"
+	fi
+	# look for /usr/share/doc
+	if [ -e "$dir"/usr/share/doc ] \
+			&& ! is_doc_pkg "$name"; then
+		warning "Found /usr/share/doc but package name doesn't end with -doc"
+	fi
+	# look for /usr/share/devhelp
+	if [ -e "$dir"/usr/share/devhelp ] \
+			&& ! is_devhelp_pkg "$name"; then
+		warning "Found /usr/share/devhelp but package name doesn't end with -devhelp"
+	fi
+	# look for /usr/share/man
+	if [ -e "$dir"/usr/share/man ]; then
+		if ! is_doc_pkg "$name"; then
+			warning "Found /usr/share/man but package name doesn't end with -doc"
+		fi
+		# check for uncompressed man pages
+		i=$(find "$dir"/usr/share/man -name '*.[0-8]' -type f | sed -e 's/^/\t/')
+		if [ -n "$i" ]; then
+			error "Found uncompressed man pages:"
+			echo "$i"
+			e=1
+		fi
+	fi
+	# look for pycache
+	# wildcard should always get the system python dir, and this is faster than
+	# trying to calculate the python version.
+	i="$(find "$dir"/usr/lib/python* \( -type d -a -name "__pycache__" \) 2>/dev/null || :)"
+	if [ -n "$i" ] && [ "${name%-pyc}" = "$name" ]; then
+		warning "Found __pycache__ but package name doesn't end with -pyc"
+	fi
+
+	# check that we don't have any files names with newline
+	i=$(find "$dir" -name $'*\n*')
+	if [ -n "$i" ]; then
+		error "Found filenames with newline:"
+		echo "$i" >&2
+		e=1
+	fi
+	# check directory permissions
+	i=$(find "$dir" -type d -perm -777 | sed -e 's/^/\t/')
+	if [ -n "$i" ]; then
+		warning "World writeable directories found:"
+		echo "$i"
+	fi
+	# check so we dont have any suid root binaries that are not PIE
+	i=$(find "$dir" -type f -perm /6000 -exec scanelf --nobanner --etype ET_EXEC {} + \
+		| sed -e 's/ET_EXEC /\t/')
+	if [ -n "$i" ]; then
+		warning "Found non-PIE files that have SUID:"
+		echo "$i"
+		warning "suid executables SHOULD be compiled with PIE if possible"
+	fi
+	# test suid bit on executable
+	if ! options_has "suid"; then
+		i=$(find "$dir" \( -perm -u+s -o -perm -g+s \) -a -type f \
+			-a -perm -o+x)
+		if [ -n "$i" ]; then
+			error "Found executable files with SUID bit set:"
+			echo "$i"
+			e=1
+		fi
+	fi
+	# test capabilities on executables
+	# see: https://gitlab.alpinelinux.org/alpine/tsc/-/issues/45
+	getcap -r "$dir" | (local r=true execothers; while read -r line; do
+		local filename="${line% *}"
+		if ! options_has "setcap"; then
+			error "Found binary with extra capabilities: $filename"
+			r=false
+		fi
+
+		execothers="$(find "$filename" -perm -o+x)"
+		if [ -n "$execothers" ]; then
+			warning "Found setcap binary executable by others: $filename"
+		fi
+	done; $r) || e=1
+
+	# test for textrels
+	if ! options_has "textrels"; then
+		local res
+		res="$(scanelf --recursive --textrel --quiet "$dir")"
+		if [ -n "$res" ]; then
+			error "Found textrels:"
+			echo "$res"
+			e=1
+		fi
+	fi
+	return $e
+}
+
+pre_split() {
+	if [ -z "$subpkgname" ]; then
+		return 0
+	fi
+	# the subpackages should not inherit these from main package
+	provides=""
+	install_if=""
+}
+
+prepare_subpackages() {
+	local i
+	cd "$startdir"
+	for i in $subpackages; do
+		# call abuild recursively, setting subpkg{dir,name}
+		( subpkg_set "$i"; msg "Running split function $subpkgsplit..."; \
+		  subpkgdir="$pkgbasedir/$subpkgname" subpkgname="$subpkgname" subpkgarch="$subpkgarch" \
+		  "$abuild_path" $forceroot $verbose pre_split $subpkgsplit prepare_package \
+			&& postcheck "$pkgbasedir/$subpkgname" "$subpkgname" ) || return 1
+	done
+	postcheck "$pkgdir" "$pkgname" || return 1
+	# post check for /usr/share/locale
+	if [ -d "$pkgdir"/usr/share/locale ]; then
+		warning "Found /usr/share/locale"
+		warning2 "Maybe add \$pkgname-lang to subpackages?"
+	fi
+	# post check for shell completions
+	if [ -d "$pkgdir"/usr/share/bash-completion ]; then
+		warning "Found /usr/share/bash-completion"
+		warning2 "Add \$pkgname-bash-completion to subpackages"
+	fi
+	if [ -d "$pkgdir"/usr/share/zsh/site-functions ]; then
+		warning "Found /usr/share/zsh/site-functions"
+		warning2 "Add \$pkgname-zsh-completion to subpackages"
+	fi
+	if [ -d "$pkgdir"/usr/share/fish/completions ]; then
+		warning "Found /usr/share/fish/completions"
+		warning2 "fish completions for programs should be located in /usr/share/fish/vendor_completions.d"
+	fi
+	if [ -d "$pkgdir"/usr/share/fish/vendor_completions.d ]; then
+		warning "Found /usr/share/fish/completions"
+		warning2 "Add \$pkgname-fish-completion to subpackages"
+	fi
+}
+
+default_lang() {
+	pkgdesc="Languages for package $pkgname"
+	install_if="$pkgname=$pkgver-r$pkgrel lang"
+	depends="$depends_lang"
+
+	amove ${langdir:-/usr/share/locale}
+}
+
+lang() {
+	default_lang
+}
+
+# echo '-dirty' if git is not clean
+git_dirty() {
+	[ $($git status -s -- "$startdir" | wc -l) -eq 0 ] || echo "-dirty"
+}
+
+# echo last commit hash id
+git_last_commit() {
+	$git rev-list -n 1 HEAD -- "$startdir"
+}
+
+# date of last commit
+git_last_commit_epoch() {
+	$git log -1 --format=%cd --date=unix $1 -- "$startdir"
+}
+
+get_maintainer() {
+	if [ -z "$maintainer" ]; then
+		maintainer=$(awk -F': ' '/# *Maintainer/ {print $2}' "$APKBUILD")
+	fi
+}
+
+check_maintainer() {
+	get_maintainer
+	if [ -z "$maintainer" ]; then
+		warning "No maintainer"
+	else
+		# try to check for a valid rfc822 address
+		case "$maintainer" in
+			" "*|*" ") error "'$maintainer' has leading or trailing space"; return 1 ;;
+			\"*|*\") error "'$maintainer' has leading or trailing quote"; return 1 ;;
+			*\ \<*@*.*\>) ;;
+			*) error "'$maintainer' is not a valid rfc822 address"; return 1 ;;
+		esac
+	fi
+}
+
+check_license() {
+	local ret=0
+	local license_list=/usr/share/spdx/license.lst
+	if options_has "!spdx" || ! [ -f "$license_list" ]; then
+		return 0
+	fi
+	local IFS="$IFS()"
+	local i; for i in $license; do
+		list_has "$i" AND OR WITH && continue
+		if ! grep -q -x -F "$i" "$license_list"; then
+			ret=1
+			warning "\"$i\" is not a known license"
+		fi
+	done
+	return $ret
+}
+
+check_secfixes_comment() {
+	local c invalid
+	c=$(sed -E -n -e '/^# secfixes:/,/(^[^#]|^$)/p' "$APKBUILD" | grep '^#')
+	invalid=$(echo "$c" \
+		| { grep -v -E '(^# secfixes:|^#  +- [A-Z0-9-]+|^#   [0-9]+.*:$|^#$)' || [ $? -eq 1 ]; })
+	if [ -z "$invalid" ]; then
+		return 0
+	fi
+
+	# check if there are tabs
+	if echo "$invalid" | grep -q $'\t'; then
+		error "secfixes comment must not have tabs:"
+		echo "$c" | grep $'\t' >&2
+		return 1
+	fi
+
+	error "secfixes comment is not valid:"
+	echo "$invalid" >&2
+	return 1
+}
+
+check_depends_dev() {
+	if [ -z "$depends_dev" ]; then
+		return 0
+	fi
+	local i
+	for i in $pkgname $subpackages; do
+		case "${i%%:*}" in
+		*-dev) return 0 ;;
+		esac
+	done
+	return 1
+}
+
+check_provides() {
+	local i
+	for i in $provides; do
+		if [ "${i%%[<>=~]*}" = "$pkgname" ]; then
+			return 1
+		fi
+	done
+	return 0
+}
+
+check_depver() {
+	local name="${1%%[<>=~]*}"
+	if [ "$name" = "$1" ]; then
+		# no version constraint
+		return 0
+	fi
+
+	local ver="${1##*[<>=~]}"
+
+	if ! $APK version --check --quiet "$ver"; then
+		error "Invalid version: $ver in $1"
+		return 1
+	fi
+
+	local sep=${1#$name}
+	sep=${sep%$ver}
+
+	local i
+	for i in "<" ">" "=" "~" ">=" "<=" ">~" "<~"; do
+		if [ "$sep" = "$i" ]; then
+			return 0
+		fi
+	done
+
+	error "Invalid version separator '$sep' in $1"
+	return 1
+}
+
+prepare_metafiles() {
+	local name=${subpkgname:-$pkgname}
+	[ -z "${name##* *}" ] && die "package name contains spaces"
+	local dir=${subpkgdir:-$pkgdir}
+	local pkg="$name-$pkgver-r$pkgrel.apk"
+	local pkginfo="$controldir"/.PKGINFO
+	local i size
+
+	[ ! -d "$dir" ] && die "Missing $dir"
+	cd "$dir"
+	mkdir -p "$controldir"
+	local builddate="$SOURCE_DATE_EPOCH"
+
+	# Fix package size on several filesystems
+	case "$(stat -f -c "%T" .)" in
+	btrfs|ecryptfs|zfs)
+		sync;;
+	esac
+
+	size=$(
+		set -o pipefail
+		{ echo 0; find . -type f -exec stat -c '%d:%i %s' -- {} + |
+		awk '!x[$1]++ {print $2}'; } | paste -sd+ - | bc | tr -d '\\\n'
+	)
+	# If package contains only empty files (or only install scripts), the size
+	# might be 0. But due to apk-tools 2 considering packages with size = 0
+	# virtual, nothing is extracted (and no scripts are ran). That will be
+	# solved in apk-tools 3. As a workaround we can set the size to 1 if any
+	# files are present or install scripts are defined.
+	if [ "$size" = 0 ]; then
+		if [ -n "$(find . ! -name .)" ]; then
+			size=1
+		else
+			for i in $install $trigger; do
+				local j=${i%=*}
+				[ "${j%.*}" = "$name" ] && {
+					size=1
+					break
+				}
+			done
+		fi
+	fi
+
+	if [ "$arch" != "$apkbuild_arch" ]; then
+		local msg="Split function set arch=\"$arch\" for $name, use subpackages=pkg:split:arch format instead"
+		[ "$arch" != "noarch" ] && die "$msg"
+		warning "$msg"
+		subpkgarch="$arch"
+	fi
+
+	echo "# Generated by $(basename "$abuild_path") $program_version" >"$pkginfo"
+	if [ -n "$FAKEROOTKEY" ]; then
+		echo "# using $($FAKEROOT -v)" >> "$pkginfo"
+	fi
+
+	if [ "${subpkgarch:-$pkgarch}" = "all" ]; then
+		die 'Internal error! ${subpkgarch:-$pkgarch} should never be "all"'
+	fi
+
+	cat >> "$pkginfo" <<-EOF
+		pkgname = $name
+		pkgver = $pkgver-r$pkgrel
+		pkgdesc = $pkgdesc
+		url = $url
+		builddate = $builddate
+		packager = ${PACKAGER:-"Unknown"}
+		size = $size
+		arch = ${subpkgarch:-$pkgarch}
+		origin = $pkgname
+	EOF
+	local deps
+	deps="$depends"
+	if [ "$pkgname" != "busybox" ] && ! depends_has busybox && ! depends_has /bin/sh; then
+		for i in $install $triggers; do
+			local s=${i%=*}
+			[ "$name" != "${s%.*}" ] && continue
+			if head -n 1 "$startdir/$s" | grep -E '^#!\s*/bin/sh' >/dev/null ; then
+				msg "Script found. /bin/sh added as a dependency for $pkg"
+				deps="$deps /bin/sh"
+				break
+			fi
+		done
+	fi
+
+	# store ABUILD_LAST_COMMIT in global var so we only call git once
+	if [ -z "$ABUILD_LAST_COMMIT" ]; then
+		ABUILD_LAST_COMMIT="$(git_last_commit)$(git_dirty)"
+	fi
+	echo "commit = $ABUILD_LAST_COMMIT" >> "$pkginfo"
+
+	get_maintainer
+	if [ -n "$maintainer" ]; then
+		echo "maintainer = $maintainer" >> "$pkginfo"
+	fi
+
+	if [ -n "$replaces_priority" ]; then
+		echo "replaces_priority = $replaces_priority" >> "$pkginfo"
+	fi
+
+	if [ -n "$provider_priority" ]; then
+		echo "provider_priority = $provider_priority" >> "$pkginfo"
+	fi
+
+	echo "license = $(echo $license)" >> "$pkginfo"
+	for i in $replaces; do
+		echo "replaces = $i" >> "$pkginfo"
+	done
+	for i in $deps; do
+		if [ "$i" != "$name" ]; then
+			check_depver "$i" || die "Invalid version in dependency: $i"
+			echo "depend = $i" >> "$pkginfo"
+		fi
+	done
+	for i in $provides; do
+		check_depver "$i" || die "Invalid version in provides: $i"
+		echo "provides = $i" >> "$pkginfo"
+	done
+	for i in $triggers; do
+		local f=${i%=*}
+		local dirs=${i#*=}
+		[ "${f%.trigger}" != "$name" ] && continue
+		echo "triggers = ${dirs//:/ }" >> "$pkginfo"
+	done
+	if [ -n "$install_if" ]; then
+		echo "install_if = $(echo $install_if)" >> "$pkginfo"
+	fi
+
+	local metafiles=".PKGINFO"
+	for i in $install $triggers; do
+		local f=${i%=*}
+		local n=${f%.*}
+		if [ "$n" != "$name" ]; then
+			continue
+		fi
+		script=${f#$name}
+		msg "Adding $script"
+		install -m 0755 "$startdir/$f" "$controldir/$script" || return 1
+		metafiles="$metafiles $script"
+	done
+	printf %s "$metafiles" | tr ' ' '\0' > "$controldir"/.metafiles
+}
+
+prepare_trace_rpaths() {
+	local etype= soname= file= sover=
+	[ "${subpkgarch:-$pkgarch}" = "noarch" ] && return 0
+	options_has "!tracedeps" && return 0
+	# lets tell all the places we should look for .so files - all rpaths
+	(
+		cd "${subpkgdir:-$pkgdir}"
+		scanelf --quiet --recursive --rpath .
+	) | awk -F '[:[:space:]]+' '{
+		sub(/^\./, "", $NF);
+		sub("/[^/]*$", "", $NF);
+		for (i = 1; i < NF; i++) {
+			# $ORIGIN means relative to the binary
+			gsub("\\$ORIGIN", $NF, $i);
+			gsub("\\${ORIGIN}", $NF, $i);
+			printf("%s\n", $i);
+		}
+	}' | sort -u >"$controldir"/.rpaths
+	if grep -q -x '/usr/lib' "$controldir"/.rpaths; then
+		# FIXME silence warning when $ORIGIN was used
+		warning "Redundant /usr/lib in rpath found"
+	fi
+	if grep '^/home/' "$controldir"/.rpaths; then
+		error "Has /home/... in rpath"
+		return 1
+	fi
+}
+
+# search for broken symlinks so we later can pull in proper depends
+prepare_symlinks() {
+	local target
+	local dir="${subpkgdir:-$pkgdir}"
+	options_has "!tracedeps" && return 0
+	cd "$dir" || return 1
+	find . -type l | while read symlink; do
+		target=$(readlink "$symlink")
+		if ! [ -e "$dir$(normalize_target_path "$target" "$symlink")" ]; then
+			echo "$symlink $target" >> "$controldir"/.symlinks
+		fi
+	done
+}
+
+prepare_pkgconfig_provides() {
+	local dir="${subpkgdir:-$pkgdir}" v
+	options_has "!tracedeps" && return 0
+	cd "$dir" || return 1
+	for i in usr/lib/pkgconfig/*.pc usr/share/pkgconfig/*.pc; do
+		if ! [ -e "$i" ]; then
+			continue
+		fi
+		local f=${i##*/}
+		v=$(PKG_CONFIG_PATH="$dir"/usr/lib/pkgconfig:"$dir"/usr/share/pkgconfig \
+			PKG_CONFIG_MAXIMUM_TRAVERSE_DEPTH=1 pkg-config \
+			--modversion ${f%.pc} | sed -E -e 's/-(alpha|beta|rc|pre)/_\1/')
+		v=${v#v}
+		$APK version --check --quiet $v || die "$i: pkgconf version $v is invalid"
+		echo "$pcprefix${f%.pc}=${v:-0}" >> "$controldir"/.provides-pc
+	done
+}
+
+prepare_command_provides() {
+	local dir="${subpkgdir:-$pkgdir}"
+	options_has "!tracedeps" && return 0
+	cd "$dir" || return 1
+	for i in bin/* sbin/* usr/bin/* usr/sbin/*; do
+		# We can't check symlinks properly with absolute paths,
+		# subpackages and dependencies so assume that they are commands
+		if ! [ -L "$i" ]; then
+			if ! [ -x "$i" ] || ! [ -f "$i" ]; then
+				continue
+			fi
+		fi
+		# exclude any provides: lines for commands that has '@' because '@'
+		# is used as seperator between command name and repository. This
+		# avoids potential conflicts
+		# ref: https://gitlab.alpinelinux.org/alpine/abuild/-/issues/10074
+		case "$i" in
+			*@*) continue;;
+		esac
+		local f=${i##*/}
+		echo $f >> "$controldir"/.provides-command
+	done
+}
+
+prepare_py_provides() {
+	local dir="${subpkgdir:-$pkgdir}" py_providers=""
+	options_has "!tracedeps" && return 0
+	cd "$dir" || return 1
+
+	# Find all directories under site-packages, ignore __pycache__ and
+	# .egg-info packages, store the basename with the proper pyX.Y prefix
+	# one per-line
+	py_providers="$(find 'usr/lib/python'*/site-packages \
+		-mindepth 1 -maxdepth 1 \
+		-type f -iname '*.py' -o -type d \
+		-exec sh -c '
+		d="$1"
+
+		# Check if we were given a directory then check if there
+		# is a file called __init__.py inside, this is required
+		# to import modules, if there is no __init__.py then the
+		# installed directory is not actually a module, this is a
+		# special case for packages that use c-extensions and
+		# install their .c and .h files to $sitelib.
+		if [ -d "$d" ] && [ ! -f "$d"/__init__.py ]; then
+			exit 0
+		fi
+
+		# Find out which version of python we are building for
+		# this will find out by looking at the MAJOR and MINOR
+		# versions in /usr/lib/pythonMAJOR.MINOR
+		pyver="${d##*usr/lib/python}"
+		pyver="${pyver%%/*}"
+
+		# Strip the .py prefix if it exists
+		d="${d%%.py*}"
+
+		echo "py$pyver:${d##*/}"
+	' sh {} \; 2>/dev/null)"
+	local i; for i in $py_providers; do
+		echo "$i=$pkgver-r$pkgrel" >> "$controldir"/.provides-py
+	done
+}
+
+# check if dir has arch specific binaries
+dir_has_arch_binaries() {
+	local dir="$1"
+	# if scanelf returns something, then we have binaries
+	[ -n "$(scanelf -R "$dir" | head -n 1)" ] && return 0
+
+	# look for static *.a
+	[ -n "$(find "$dir" -type f -name '*.a' | head -n 1)" ] && return 0
+
+	# look for precompiled lua files (luac: 0x1b Lua; luajit: 0x1b LJ)
+	find "$dir" -type f \( -name '*.lua' -o -name '*.luac' \) -exec od -N 4 -A n -t x4 -- {} \; |
+		grep -q -E -e '(6175|4a)4c1b$' && return 0
+
+	return 1
+}
+
+# returns true if this is the -dev package
+is_dev_pkg() {
+	test "${1%-dev}" != "$1"
+}
+
+# returns true if this is the -static package
+is_static_pkg() {
+	test "${1%-static}" != "$1"
+}
+
+# returns true if this is the -doc package
+is_doc_pkg() {
+	test "${1%-doc}" != "$1"
+}
+
+# returns true if this is the -devhelp package
+is_devhelp_pkg() {
+	test "${1%-devhelp}" != "$1"
+}
+
+# returns true if this is the -openrc package
+is_openrc_pkg() {
+	test "${1%-openrc}" != "$1"
+}
+
+# check that noarch is set if needed
+archcheck() {
+	options_has "!archcheck" && return 0
+	if dir_has_arch_binaries "${subpkgdir:-$pkgdir}"; then
+		[ "${subpkgarch:-$pkgarch}" != "noarch" ] && return 0
+		error "Arch specific binaries found so arch must not be set to \"noarch\""
+		return 1
+	elif [ "${subpkgarch:-$pkgarch}" != "noarch" ] && ! is_dev_pkg "$subpkgname" && ! is_static_pkg "$subpkgname"; then
+		# we dont want -dev package go to noarch
+		warning "No arch specific binaries found so arch should probably be set to \"noarch\""
+	fi
+	return 0
+}
+
+prepare_package() {
+	msg "Preparing ${subpkgname:+sub}package ${subpkgname:-$pkgname}..."
+	stripbin
+	prepare_metafiles \
+		&& prepare_trace_rpaths \
+		&& prepare_symlinks \
+		&& prepare_pkgconfig_provides \
+		&& prepare_command_provides \
+		&& prepare_py_provides \
+		|| return 1
+	archcheck
+}
+
+pkginfo_val() {
+	local key="$1"
+	local file="$2"
+	awk -F ' = ' "\$1 == \"$key\" {print \$2}" "$file"
+}
+
+# find real path to so files
+real_so_path() {
+	local so="$1"
+	shift
+	while [ $# -gt 0 ]; do
+		[ -e "$1"/$so ] && realpath "$1/$so" && return 0
+		shift
+	done
+	error "$so: path not found"
+	return 1
+}
+
+# search rpaths and /usr/lib /lib for given so files
+find_so_files() {
+	local rpaths
+	rpaths=$(cat "$1")
+	shift
+	while [ $# -gt 0 ]; do
+		real_so_path "$1" /usr/lib /lib $rpaths || return 1
+		shift
+	done
+	return 0
+}
+
+subpkg_provides_prefixed_so() {
+	[ -n "$sonameprefix" ] && grep -q -w "^$sonameprefix$1" \
+		"$pkgbasedir"/.control.*/.provides-so 2>/dev/null
+}
+
+subpkg_provides_so() {
+	grep -q -w "^$1" "$pkgbasedir"/.control.*/.provides-so 2>/dev/null
+}
+
+subpkg_provides_prefixed_pc() {
+	[ -n "$pcprefix" ] && grep -q -w "^$pcprefix$1" \
+		"$pkgbasedir"/.control.*/.provides-pc 2>/dev/null
+}
+
+subpkg_provides_pc() {
+	grep -q -w "^${1%%[<>=]*}" "$pkgbasedir"/.control.*/.provides-pc \
+		2>/dev/null
+}
+
+trace_apk_deps() {
+	local name="$1"
+	local dir="$2"
+	local parch="$3"
+	local i= found= autodeps= deppkgs= missing=
+	local apkroot=
+
+	if [ "$CBUILD" != "$CHOST" ] || [ "$CBUILD_ARCH" != "$(arch2dir "$parch")" ]; then
+		apkroot="--root $CBUILDROOT --arch $CTARGET_ARCH"
+	fi
+
+	msg "Tracing dependencies..."
+	# add pkgconfig if usr/lib/pkgconfig is found
+	if [ -d "$pkgbasedir"/$name/usr/lib/pkgconfig ] || [ -d "$pkgbasedir"/$name/usr/share/pkgconfig ] \
+			&& ! grep -q '^depend = pkgconfig' "$dir"/.PKGINFO; then
+		autodeps="$autodeps pkgconfig"
+	fi
+
+	[ -f "$dir"/.needs-so ] && for i in $(cat "$dir"/.needs-so); do
+		# first check if its provided by same apkbuild
+		grep -q -w "^$sonameprefix$i" "$dir"/.provides-so 2>/dev/null && continue
+
+		if subpkg_provides_prefixed_so "$i"; then
+			autodeps="$autodeps so:$sonameprefix$i"
+		elif subpkg_provides_so "$i" \
+				|| $APK $apkroot info --quiet -e "so:$i"; then
+			autodeps="$autodeps so:$i"
+		else
+			missing="$missing $i"
+		fi
+	done
+
+	# find all packages that holds the so files
+	if [ -f "$dir"/.rpaths ]; then
+		local so_files
+		so_files=$(find_so_files "$dir"/.rpaths $missing) \
+			|| return 1
+		if [ -n "$so_files" ]; then
+			deppkgs=$($APK $apkroot info --quiet --who-owns $so_files) || return 1
+		fi
+	fi
+
+	for found in $deppkgs; do
+		if grep -w "^depend = ${found}$" "$dir"/.PKGINFO >/dev/null ; then
+			warning "You can remove '$found' from depends"
+			continue
+		fi
+		autodeps="$autodeps $found"
+	done
+
+	# symlink targets
+	for i in $(sort -u "$dir"/.symlinks-needs 2>/dev/null); do
+		autodeps="$autodeps $i"
+	done
+
+	# python3 dependencies
+	for i in $(sort -u "$dir"/.python3-needs 2>/dev/null); do
+		autodeps="$autodeps $i"
+	done
+
+	# debuginfo conflict dependencies
+	local ver=$pkgver-r$pkgrel
+	for i in $(sort -u "$dir"/.debug-target-pkgs 2>/dev/null); do
+		autodeps="$autodeps !$i<$ver !$i>$ver"
+	done
+
+	# pkg-config depends
+	local provider owner
+	for i in $(sort -u "$dir"/.needs-pc 2>/dev/null); do
+		# first check if its provided by same apkbuild
+		grep -q -w "^$pcprefix$i" "$dir"/.provides-pc 2>/dev/null && continue
+
+		if subpkg_provides_prefixed_pc "$i"; then
+			autodeps="$autodeps pc:$pcprefix$i"
+		elif subpkg_provides_pc "$i" \
+				|| $APK $apkroot info --quiet -e "pc:$i"; then
+			provider=$($APK $apkroot search --quiet --exact "pc:$i")
+			if list_has "$provider" $depends_dev; then
+				warning "$provider should be removed from depends_dev"
+			fi
+			autodeps="$autodeps pc:$i"
+		else
+			warning "Could not find any provider for pc:$i"
+		fi
+	done
+
+	echo "# automatically detected:" >> "$dir"/.PKGINFO
+	if [ -f "$dir"/.provides-so ]; then
+		sed 's/^\(.*\) \([0-9].*\)/provides = so:\1=\2/' \
+			"$dir"/.provides-so | sort -u \
+			>> "$dir"/.PKGINFO
+	fi
+	if [ -f "$dir"/.provides-pc ]; then
+		sed 's/^/provides = pc:/' "$dir"/.provides-pc | sort -u \
+			>> "$dir"/.PKGINFO
+	fi
+	if [ -f "$dir"/.provides-command ]; then
+		sed -e 's/^/provides = cmd:/' -e "s/\$/=$pkgver-r$pkgrel/" \
+			 "$dir"/.provides-command | sort -u \
+			>> "$dir"/.PKGINFO
+	fi
+	if [ -f "$dir"/.provides-py ]; then
+		sed 's/^/provides = /' "$dir"/.provides-py | sort -u \
+			>> "$dir"/.PKGINFO
+	fi
+	for i in $autodeps; do
+		echo "depend = $i"
+	done | sort -u >> "$dir"/.PKGINFO
+	# display all depends
+	sed -n '/^depend =/s/depend = /\t/p' "$dir"/.PKGINFO >&2
+}
+
+find_scanelf_paths() {
+	local datadir="$1"
+	local paths="$datadir/lib:$datadir/usr/lib" i= rpaths=
+	if [ -n "$ldpath" ]; then
+		paths="$paths:$(echo "${datadir}${ldpath}" | sed "s|:|:$datadir|g")"
+	fi
+	# search in all rpaths
+	local IFS=:
+	for rpaths in "$pkgbasedir"/.control.*/.rpaths; do
+		[ -f "$rpaths" ] || continue
+		while read i; do
+			local dir="${datadir}${i}"
+			if [ -d "$dir" ] && ! list_has "$dir" $paths; then
+				paths="$paths:${dir}"
+			fi
+		done < "$rpaths"
+	done
+	echo "$paths"
+}
+
+scan_shared_objects() {
+	local name="$1" controldir="$2" datadir="$3"
+	local opt= i= dupes=
+
+	if [ "${subpkgarch:-$pkgarch}" = "noarch" ]; then
+		return 0
+	fi
+
+	# allow spaces in paths
+	local IFS=:
+	set -- $(find_scanelf_paths "$datadir")
+	unset IFS
+
+	# validation check, verify that each path is prefixed with datadir
+	for i; do
+		if [ "${i#$datadir}" = "$i" ]; then
+			error "Internal error in scanelf paths"
+			return 1
+		fi
+	done
+
+	if options_has "ldpath-recursive"; then
+		opt="--recursive"
+	fi
+	msg "Scanning shared objects"
+	# lets tell all the .so files this package provides in .provides-so
+	local etype soname file
+	scanelf --nobanner --soname $opt "$@" | while read etype soname file; do
+		# if soname field is missing, soname will be the filepath
+		sover=0
+		if [ -z "$file" ]; then
+			file="$soname"
+			soname=${soname##*/}
+		fi
+
+		# we only want shared libs
+		case $soname in
+		*.o) continue;;
+		*.so|*.so.[0-9]*|*.c32);;
+		*) continue;;
+		esac
+
+		case "$file" in
+		*.so.[0-9]*) sover=${file##*.so.};;
+		*.so)
+			# filter out sonames with version when file does not
+			# have version
+			case "$soname" in
+			*.so.[0-9]*)
+				if options_has "sover-namecheck"; then
+					continue
+				fi
+			esac
+			;;
+		esac
+		list_has "$soname" $somask && continue
+		echo "$sonameprefix$soname $sover"
+	# use awk to filter out dupes that has sover = 0
+	done | awk '{ if (so[$1] == 0) so[$1] = $2; }
+		END { for (i in so) print(i " " so[i]); }' \
+		| sort -u > "$controldir"/.provides-so
+
+	# verify that we dont have any duplicates
+	dupes="$(cut -d' ' -f1 "$controldir"/.provides-so | uniq -d)"
+	if [ -n "$dupes" ]; then
+		die  "provides multiple versions of same shared object: $dupes"
+	fi
+
+	# now find the so dependencies
+	scanelf --nobanner --recursive --needed  --etype ET_DYN,ET_EXEC "$datadir"  | tr ' ' ':' \
+		| awk -F ":" '$2 != "" {print $2}'  \
+		| sed 's:,:\n:g' | sort -u \
+	| while read soname; do
+		# only add files that are not self provided
+		grep -q -w "^$sonameprefix$soname" "$controldir"/.provides-so \
+			|| list_has "$soname" $somask \
+			|| echo $soname
+	done > "$controldir"/.needs-so
+}
+
+# normalize a symlink target path (1st arg)
+# Converts a relative path to absolute with respect to the symlink
+# path (2nd arg).
+normalize_target_path() {
+	local path=$1
+	[ "${path:0:1}" = / ] || path=$(dirname "$2")/$path
+
+	local pathstr= i=
+	local IFS='/'
+	set -- $path
+	for i; do
+		case "$i" in
+		"."|"") continue;;
+		"..")   pathstr="${pathstr%%/${pathstr##*/}}";;
+		*) pathstr="${pathstr}/$i";;
+		esac
+	done
+	echo "$pathstr"
+}
+
+# find which package provides file that symlink points to
+scan_symlink_targets() {
+	local name="$1" dir="$2" datadir="$3"
+	local symfile= targetpath=
+	cd "$datadir"
+	for symfile in "$pkgbasedir"/.control.*/.symlinks; do
+		local d="${symfile%/.symlinks}"
+		if ! [ -e "$symfile" ] || [ "$d" = "$dir" ]; then
+			continue
+		fi
+
+		while read symlink target; do
+			targetpath=$datadir$(normalize_target_path "$target" "$symlink")
+			if [ -e "$targetpath" ] || [ -L "$targetpath" ]; then
+				echo "$name=$pkgver-r$pkgrel" \
+					>> "$d"/.symlinks-needs
+			fi
+		done < "$symfile"
+	done
+}
+
+# check if python3 site packages are installed and depend on a compatible version
+scan_python3_dependency() {
+	local controldir="$2" datadir="$3"
+	local dir_count=0
+	local site_pkg_dir
+	for site_pkg_dir in "$datadir"/usr/lib/python3*/site-packages; do
+		if ! [ -d "$site_pkg_dir" ]; then
+			# empty iteration
+			continue
+		fi
+		dir_count=$((dir_count + 1))
+		if [ "$dir_count" -gt 1 ]; then
+			error "package contains python3 modules for conflicting python3 versions"
+			return 1
+		fi
+		local pyver="${site_pkg_dir##*usr/lib/python}"
+		pyver="${pyver%%/*}"
+		if [ -n "$pyver" ] && [ "${subpkgname:-$pkgname}" != python3 ]; then
+			echo "python3~$pyver" \
+				>> "$controldir"/.python3-needs
+		fi
+	done
+}
+
+# find the packages containing the binaries corresponding to the debug files
+scan_debuginfo_targets() {
+	local root=$3/usr/lib/debug
+	[ -d "$root" ] || return 0
+
+	find "$root" -name "*.debug" | while read path; do
+		path=${path#$root}
+		path=${path%.debug}
+		for pkgdir in "$pkgbasedir"/*; do
+			if [ -x "$pkgdir$path" ]; then
+				echo "${pkgdir#$pkgbasedir/}"
+			fi
+		done
+	done > "$dir"/.debug-target-pkgs
+}
+
+#find pkg-config dependencies
+scan_pkgconfig_depends() {
+	local provides_pc="$1" controldir= name= datadir=
+	[ -e "$provides_pc" ] || return 0
+	controldir="${provides_pc%/*}"
+	name="$(pkginfo_val pkgname "$controldir"/.PKGINFO)"
+	datadir="$pkgbasedir"/$name
+	for i in $(sort -u "$provides_pc"); do
+		PKG_CONFIG_PATH="$datadir"/usr/lib/pkgconfig:"$datadir"/usr/share/pkgconfig \
+				pkg-config \
+				--print-requires \
+				--print-requires-private ${i%=*} \
+				| sed -E 's/\s*([<>=]+)\s*/\1/' \
+				| while read pc; do
+			# only add files that are not self provided
+			if ! grep -q -w "^${pc%%[<>=]*}" "$provides_pc"; then
+				echo "$pc" >> "$controldir"/.needs-pc
+			fi
+		done
+	done
+}
+
+# read size in bytes from stdin and show as human readable
+human_size() {
+	awk '{  split("B KB MB GB TB PB", type)
+		for(i=5; y < 1 && $1 > 0; i--)
+			y = $1 / (2^(10*i))
+		printf("%.1f %s\n", y, type[i+2]) }'
+}
+
+create_apks() {
+	local file= dir= name= ver= apk= datadir= size= i= gzip=
+	gzip=$(command -v pigz || echo gzip)
+	if ! options_has "keepdirs"; then
+		rmdir "$pkgdir"/usr/lib \
+			"$pkgdir"/usr/bin \
+			"$pkgdir"/usr/share \
+			"$pkgdir"/usr \
+			"$pkgdir"/etc/ \
+			"$pkgdir"/lib/ \
+			2>/dev/null || :
+	fi
+	if ! options_has "!tracedeps"; then
+		for file in "$pkgbasedir"/.control.*/.PKGINFO; do
+			dir="${file%/.PKGINFO}"
+			name="$(pkginfo_val pkgname "$file")"
+			datadir="$pkgbasedir"/$name
+			subpkgname=$name
+			scan_shared_objects "$name" "$dir" "$datadir"
+			scan_symlink_targets "$name" "$dir" "$datadir"
+			scan_python3_dependency "$name" "$dir" "$datadir"
+			scan_debuginfo_targets "$name" "$dir" "$datadir"
+		done
+		for file in "$pkgbasedir"/.control.*/.provides-pc; do
+			scan_pkgconfig_depends "$file"
+		done
+	fi
+
+	for i in root $pkgusers; do
+		printf '%s %s:0\n' "$i" "$i"
+	done > "$pkgbasedir"/.owner-map
+	for i in root $pkggroups; do
+		printf '%s %s:0\n' "$i" "$i"
+	done > "$pkgbasedir"/.group-map
+
+	local name ver size subpkgarch sha256
+	for file in "$pkgbasedir"/.control.*/.PKGINFO; do
+		local dir="${file%/.PKGINFO}"
+		name=$(pkginfo_val pkgname "$file")
+		ver=$(pkginfo_val pkgver "$file")
+		size=$(pkginfo_val size "$file")
+		local apk=$name-$ver.apk
+		local datadir="$pkgbasedir"/$name
+		subpkgname=$name
+		subpkgarch=$(pkginfo_val arch "$file")
+
+		# See https://gitlab.alpinelinux.org/alpine/tsc/-/issues/16
+		if ! options_has "bigdocs" && is_doc_pkg "$name" && [ "$size" -gt "$doc_threshold" ]; then
+			warning "The -doc subpackage is unusually large, consider splitting it"
+		fi
+
+		trace_apk_deps "$name" "$dir" "$subpkgarch" || return 1
+		msg "Package size: $(echo "$size" | human_size)"
+		msg "Compressing data..."
+		(
+		cd "$datadir"
+		# data.tar.gz
+		set -- *
+		if [ "$1" != '*' ]; then
+			# normalize timestamps
+			find "$@" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+
+			# explicitly sort package content
+			find "$@" -print0
+		fi | LC_ALL=C sort -z | apk_tar -T - --xattrs \
+			--xattrs-exclude=security.selinux \
+			--owner-map="$pkgbasedir"/.owner-map \
+			--group-map="$pkgbasedir"/.group-map \
+			| abuild-tar --hash | $gzip -n -9 >"$dir"/data.tar.gz
+
+		msg "Create checksum..."
+		# append the hash for data.tar.gz
+		sha256=$(sha256sum "$dir"/data.tar.gz | cut -f1 -d' ')
+		echo "datahash = $sha256" >> "$dir"/.PKGINFO
+		touch -h -d "@$SOURCE_DATE_EPOCH" "$dir"/.PKGINFO
+
+		# control.tar.gz
+		cd "$dir"
+		apk_tar -T - < .metafiles | abuild-tar --cut \
+			| $gzip -n -9 > control.tar.gz
+		abuild-sign -q control.tar.gz || exit 1
+
+		msg "Create $apk"
+		mkdir -p "$REPODEST/$repo/$(arch2dir "$subpkgarch")"
+		cat control.tar.gz data.tar.gz > "$REPODEST/$repo/$(arch2dir "$subpkgarch")/$apk"
+		)
+	done
+}
+
+build_abuildrepo() {
+	local part _check=check _starttime _endtime _difftime
+	if options_has "checkroot"; then
+		_check=check_fakeroot
+	fi
+	if ! want_check; then
+		_check=true
+	fi
+	if ! apk_up2date || [ -n "$force" ]; then
+		# check early if we have abuild key
+		abuild-sign --installed
+		logcmd "building $repo/$pkgname-$pkgver-r$pkgrel"
+		_starttime=$(date -u +%s)
+		msg "Building $repo/$pkgname $pkgver-r$pkgrel (using $program $program_version) started $(date -R)"
+
+		# make sure SOURCE_DATE_EPOCH is set
+		set_source_date
+
+		for part in validate builddeps clean fetch unpack prepare mkusers build \
+				$_check rootpkg; do
+			runpart $part
+		done
+		_endtime=$(date -u +%s)
+		_difftime=$((_endtime - _starttime))
+		msg "Build complete at $(date -R) elapsed time $((_difftime/3600))h $((_difftime/60%60))m $((_difftime%60))s"
+		cleanup $CLEANUP
+	fi
+	update_abuildrepo_index
+}
+
+update_abuildrepo_index() {
+	local i allarch=""
+	for i in $allpackages; do
+		subpkg_set "$i"
+		##NOARCH: These packages are really in $CARCH and do not need their
+		# own repository. --rewrite-arch is used below to make sure the index
+		# thinks they are for $CARCH and apk-tools will fetch them from
+		# correct URL path. Remainder of the script uses $(arch2dir "$subpkgarch")
+		# when expanding to the target repository path.
+		[ "$subpkgarch" = "noarch" ] && subpkgarch="$CARCH"
+		list_has "$subpkgarch" "$allarch" || allarch="$allarch $subpkgarch"
+	done
+	subpkg_unset
+
+	if [ -z "$DESCRIPTION" ]; then
+		DESCRIPTION="$repo $(cd $startdir && $git describe 2>/dev/null || true)"
+	fi
+
+	local oldpwd="$PWD"
+	for i in $allarch; do
+		cd "$REPODEST/$repo/$i"
+
+		msg "Updating the $repo/$i repository index..."
+		local oldindex=
+		if [ -f APKINDEX.tar.gz ]; then
+			oldindex="--index APKINDEX.tar.gz"
+		fi
+		( $APK index $ABUILD_APK_INDEX_OPTS --no-warnings --quiet $oldindex --output APKINDEX.tar.gz.$$ \
+			--description "$DESCRIPTION" --rewrite-arch $i *.apk && \
+		  msg "Signing the index..." && \
+		  abuild-sign -q APKINDEX.tar.gz.$$ && \
+		  chmod 644 APKINDEX.tar.gz.$$ && \
+		  mv APKINDEX.tar.gz.$$ APKINDEX.tar.gz \
+		) || (rm -f APKINDEX.tar.gz.$$ ; die "Failed to create index")
+	done
+	cd "$oldpwd"
+}
+
+# predefined function check
+default_check() {
+	warning "APKBUILD does not run any tests!"
+	msg2 "Alpine policy will soon require that packages have any relevant testsuites run during the build process."
+	msg2 "To fix, either define a check() function, or declare !check in \$options to indicate the package does not have a testsuite."
+}
+
+check() {
+	default_check
+}
+
+# predefined splitfunc doc
+default_doc() {
+	local gzip
+	gzip=$(command -v pigz || echo gzip)
+	depends="$depends_doc"
+	pkgdesc="$pkgdesc (documentation)"
+	install_if="docs $pkgname=$pkgver-r$pkgrel"
+
+	local i
+	for i in doc man info html sgml licenses gtk-doc ri help; do
+		amove usr/share/"$i" || :
+	done
+
+	# compress man pages
+	local mandir="$subpkgdir"/usr/share/man
+	[ -d "$mandir" ] && find "$mandir" -type l \
+		-a \( -name \*.[0-9n] -o -name \*.[0-9n][a-z]* \) \
+		-a \! \( -name '*.gz' -o -name '*.bz2' -o -name '*.xz' \) \
+		| while read symlink; do
+
+		ln -s $(readlink $symlink).gz "$symlink".gz
+		rm -f "$symlink"
+	done
+	[ -d "$mandir" ] && find "$mandir" -type f \
+		-a \( -name \*.[0-9n] -o -name \*.[0-9n][a-z]* \) \
+		-a \! \( -name '*.gz' -o -name '*.bz2' -o -name '*.xz' \) \
+		-exec stat -c "%i %n" \{\} \+ | sort | while read inode name; do
+
+		# Skip hardlinks removed in last iteration.
+		[ -f "$name" ] || continue
+
+		local islink=0
+		find "$mandir" -type f -links +1 \
+			-a \( -name \*.[0-9n] -o -name \*.[0-9n][a-z]* \) \
+			-a \! \( -name '*.gz' -o -name '*.bz2' -o -name '*.xz' \) \
+			-exec stat -c "%i %n" \{\} \+ | while read linode lname; do
+			if [ "$linode" = "$inode" -a "$lname" != "$name" ]; then
+				islink=1
+				rm -f "$lname"
+				ln -s "${name##*/}".gz "$lname".gz
+			fi
+		done
+
+		[ $islink -eq 0 ] && $gzip -n -9 "$name"
+	done
+
+	rm -f "$subpkgdir/usr/share/info/dir"
+}
+
+doc() {
+	default_doc
+}
+
+# predefined splitfunc dbg
+default_dbg() {
+	local f
+	pkgdesc="$pkgdesc (debug symbols)"
+
+	# assume $pkgbasedir is all one filesystem
+	mkdir -p "$pkgbasedir/.dbg-tmp"
+	# note: the subpkgdir doesn't exist when the glob is evaluated
+	scanelf -RyB -E ET_DYN "$pkgbasedir"/* | while read type src; do
+		local ino dst=$subpkgdir/usr/lib/debug/${src#"$pkgbasedir"/*/}.debug
+		mkdir -p "${dst%/*}"
+		ino=$(stat -c %i "$src")
+		if ! [ -e "$pkgbasedir/.dbg-tmp/$ino" ]; then
+			local tmp=$pkgbasedir/.dbg-tmp/${src##*/}
+			${CROSS_COMPILE}objcopy --only-keep-debug "$src" "$dst"
+			${CROSS_COMPILE}objcopy --add-gnu-debuglink="$dst" --strip-unneeded -R .comment "$src" "$tmp"
+			# preserve attributes, links
+			cat "$tmp" > "$src"
+			rm "$tmp"
+			ln "$dst" "$pkgbasedir/.dbg-tmp/$ino"
+		fi
+	done
+	rm -r "$pkgbasedir/.dbg-tmp"
+	return 0
+}
+
+dbg() {
+	default_dbg
+}
+
+# predefined splitfunc dev
+default_dev() {
+	local i= j=
+	depends="$depends_dev"
+	pkgdesc="$pkgdesc (development files)"
+
+	cd "$pkgdir" || return 0
+	local libdirs=usr/
+	[ -d lib/ ] && libdirs="lib/ $libdirs"
+	for i in usr/include usr/lib/pkgconfig usr/share/pkgconfig \
+			usr/share/aclocal usr/share/gettext \
+			usr/bin/*-config usr/share/vala/vapi \
+			usr/share/gir-[0-9]* usr/share/qt*/mkspecs \
+			usr/lib/qt*/mkspecs usr/lib/cmake usr/share/cmake \
+			usr/lib/glade/modules usr/share/glade/catalogs \
+			$(find . -name include -type d) \
+			$(subpackage_types_has static || find $libdirs \
+				-name '*.a' 2>/dev/null) \
+			$(find $libdirs -name '*.[cho]' \
+				-o -name '*.prl' 2>/dev/null); do
+		if [ -e "$pkgdir/$i" ] || [ -L "$pkgdir/$i" ]; then
+			amove "$i"
+		fi
+	done
+	# move *.so links needed when linking the apps to -dev packages
+	for i in lib/*.so usr/lib/*.so; do
+		[ -L "$i" ] && amove "$i"
+	done
+	return 0
+}
+
+dev() {
+	default_dev
+}
+
+# predefined splitfunc static
+default_static() {
+	local i= devpkg
+
+	# search for -dev package matching our prefix
+	if [ -z "$depends_static" ]; then
+		devpkg="${subpkgname%-libs-static}"
+		devpkg="${devpkg%-static}"
+		devpkg="$devpkg-dev"
+		if subpackages_has "$devpkg"; then
+			depends_static="$devpkg"
+		fi
+	fi
+
+	depends="$depends_static"
+	pkgdesc="$pkgdesc (static library)"
+
+	cd "$pkgdir" || return 0
+	local libdirs=usr/lib
+	[ -d lib/ ] && libdirs="lib/ $libdirs"
+
+	# move *.a static library
+	amove $(find $libdirs -name '*.a')
+
+	return 0
+}
+
+static() {
+	default_static
+}
+
+# predefined splitfunc libs
+default_libs() {
+	depends="$depends_libs"
+	pkgdesc="$pkgdesc (libraries)"
+
+	amove 'lib/lib*.so.[0-9]*' 'usr/lib/lib*.so.[0-9]*' || :
+}
+
+libs() {
+	default_libs
+}
+
+# predefined splitfunc openrc
+default_openrc() {
+	depends="$depends_openrc"
+	pkgdesc="$pkgdesc (OpenRC init scripts)"
+	install_if="openrc ${subpkgname%-openrc}=$pkgver-r$pkgrel"
+
+	amove etc/conf.d etc/init.d etc/user/conf.d etc/user/init.d || :
+}
+
+openrc() {
+	default_openrc
+}
+
+default_devhelp() {
+	depends=""
+	pkgdesc="$pkgname - devhelp files"
+	install_if="$pkgname=$pkgver-r$pkgrel devhelp"
+
+	amove usr/share/devhelp
+}
+
+devhelp() {
+	default_devhelp
+}
+
+default_bashcomp() {
+	depends=""
+	pkgdesc="Bash completions for $pkgname"
+	install_if="${subpkgname%-bash-completion}=$pkgver-r$pkgrel bash-completion"
+
+	cd "$pkgdir" || return 0
+	amove usr/share/bash-completion/completions
+}
+
+bashcomp() {
+	default_bashcomp
+}
+
+default_zshcomp() {
+	depends=""
+	pkgdesc="Zsh completions for $pkgname"
+	install_if="${subpkgname%-zsh-completion}=$pkgver-r$pkgrel zsh"
+
+	amove usr/share/zsh/site-functions
+}
+
+zshcomp() {
+	default_zshcomp
+}
+
+default_fishcomp() {
+	depends=""
+	pkgdesc="Fish completions for $pkgname"
+	install_if="${subpkgname%-fish-completion}=$pkgver-r$pkgrel fish"
+
+	cd "$pkgdir" || return 0
+	amove usr/share/fish/vendor_completions.d || :
+
+	amove usr/share/fish/completions &&
+		warning "fish completions for programs should be in /usr/share/fish/vendor_completions.d"
+
+	return 0
+}
+
+fishcomp() {
+	default_fishcomp
+}
+
+default_pyc() {
+	pkgdesc="Precompiled Python bytecode for ${subpkgname%-pyc}"
+	install_if="${subpkgname%-pyc}=$pkgver-r$pkgrel pyc"
+
+	cd "$pkgdir" || return 0
+	local IFS=$'\n'
+	amove $(find usr/lib/python* -type d -name __pycache__)
+}
+
+pyc() {
+	default_pyc
+}
+
+default_nftrules() {
+	pkgdesc="$pkgdesc (nftables ruleset)"
+	install_if="nftables-rulesets ${subpkgname%-nftrules}=$pkgver-r$pkgrel"
+
+	if [ -d "$pkgdir"/usr/share/nftables.avail ]; then
+		amove 'usr/share/nftables.avail/*.nft'
+	fi
+}
+
+nftrules() {
+	default_nftrules
+}
+
+is_function() {
+	type "$1" 2>&1 | head -n 1 | grep -E -q "is a (shell )?function"
+}
+
+do_fakeroot() {
+	if [ -n "$FAKEROOT" ]; then
+		msg "Entering fakeroot..."
+		$FAKEROOT -- "$@"
+	else
+		"$@"
+	fi
+}
+
+# wrap check() with fakeroot
+check_fakeroot() {
+	cd "$startdir"
+	do_fakeroot "$abuild_path" $forceroot $color_opt $keep_build $verbose check
+}
+
+# build and package in fakeroot
+rootpkg() {
+	cd "$startdir"
+	rm -rf "$pkgdir"
+
+	do_fakeroot "$abuild_path" $forceroot $color_opt $keep_build $verbose \
+		set_source_date \
+		package \
+		prepare_subpackages \
+		prepare_package \
+		create_apks
+}
+
+srcpkg() {
+	echo "Ensuring source is fetched"
+	fetch
+	local p="$pkgname-$pkgver-$pkgrel"
+	local prefix="${startdir##*/}"
+	local i files="$prefix/APKBUILD"
+	for i in $source; do
+		echo "Packaging source file: $i"
+		if [ ! -e $(filename_from_uri $i) ]; then
+			cp $srcdir/$(filename_from_uri $i) $(filename_from_uri $i)
+		fi
+		files="$files $prefix/$(filename_from_uri $i)"
+	done
+
+	for i in $install; do
+		echo "Packaging install file: $i"
+		files="$files $prefix/$i"
+	done
+
+	for i in $triggers; do
+		local f=${i%=*}
+		echo "Packaging trigger file: $f"
+		files="$files $prefix/$f"
+	done
+
+	mkdir -p "$REPODEST/src"
+	msg "Creating source package $p.src.tar.gz..."
+	(cd .. && tar -zcf "$REPODEST/src/$p.src.tar.gz" $files)
+}
+
+# return true if arch is supported or noarch
+check_arch() {
+	local ret=1
+	local i
+	for i in $arch; do
+		case $i in
+		all | noarch) ret=0 ;;
+		"$CARCH") ret=0 ;;
+		"!$CARCH") return 1 ;;
+		esac
+	done
+	return $ret
+}
+
+# check if package is up to date
+apk_up2date() {
+	local i s
+	for i in $allpackages; do
+		subpkg_set "$i"
+		if [ ! -f "$REPODEST/$repo/$(arch2dir "$subpkgarch")/$subpkgname-$pkgver-r$pkgrel.apk" ]; then
+			subpkg_unset
+			return 1
+		fi
+	done
+	subpkg_unset
+	[ -n "$keep" ] && return 0
+
+	cd "$startdir"
+	for i in $source APKBUILD; do
+		if is_remote "$i"; then
+			s="$SRCDEST/$(filename_from_uri $i)"
+		else
+			s="$startdir/${i##*/}"
+		fi
+		if [ "$s" -nt "$REPODEST/$repo/$(arch2dir "$pkgarch")/$pkgname-$pkgver-r$pkgrel.apk" ]; then
+			return 1
+		fi
+	done
+	return 0
+}
+
+abuildindex_up2date() {
+	local i dir
+
+	for i in $allpackages; do
+		subpkg_set "$i"
+		dir="$REPODEST/$repo/$(arch2dir "$subpkgarch")"
+		local idx="$dir"/APKINDEX.tar.gz
+		local file="$dir"/$subpkgname-$pkgver-r$pkgrel.apk
+
+		# if any file is missing or .apk is newer then index
+		# the index needs to be updated
+		if [ ! -f "$idx" -o ! -f "$file" -o "$file" -nt "$idx" ]; then
+			subpkg_unset
+			return 1
+		fi
+	done
+	subpkg_unset
+
+	return 0
+}
+
+up2date() {
+	check_arch || return 0
+	apk_up2date && abuildindex_up2date
+}
+
+calcdeps() {
+	builddeps=
+	hostdeps=
+
+	if cross_compiling && [ -n "$makedepends_build" -o -n "$makedepends_host" ]; then
+		for i in $EXTRADEPENDS_BUILD $1 $makedepends_build; do
+			list_has $i $builddeps && continue
+			builddeps="$builddeps $i"
+		done
+		for i in $EXTRADEPENDS_HOST $EXTRADEPENDS_TARGET $makedepends_host; do
+			[ "$pkgname" = "${i%%[<>=~]*}" ] && continue
+			list_has $i $hostdeps && continue
+			subpackages_has ${i%%[<>=~]*} || hostdeps="$hostdeps $i"
+		done
+	else
+		[ -z "$makedepends" ] && makedepends="$makedepends_build $makedepends_host"
+		want_check && makedepends="$makedepends $checkdepends"
+		for i in $EXTRADEPENDS_BUILD $EXTRADEPENDS_HOST $1 $depends $makedepends; do
+			[ "$pkgname" = "${i%%[<>=~]*}" ] && continue
+			list_has $i $builddeps && continue
+			subpackages_has ${i%%[<>=~]*} || builddeps="$builddeps $i"
+		done
+		hostdeps="$EXTRADEPENDS_TARGET"
+	fi
+}
+
+get_missing_deps() {
+	local cmd="$APK info --quiet -e $1"
+	shift
+
+	while [ "$1" ]; do
+		local cp=${1#\!}
+		if [ $cp != $1 ]; then
+			if $cmd $cp; then
+				error "Conflicting package installed: $cp"
+				return 1
+			fi
+		elif ! $cmd $1; then
+			echo $1
+		fi
+		shift
+	done
+}
+
+apk_add_makedeps() {
+	local prefix=$1 repo_args
+	shift
+
+	repo_args="--repository $(shell_escape "$REPODEST/$repo")"
+	[ -s "$repo_template" ] && while read r; do
+		repo_args="$repo_args --repository $(shell_escape "$REPODEST/${r##*/}")"
+	done < "$repo_template"
+
+	eval "$SUDO_APK" add --no-interactive "$apk_opt_wait" "$repo_args" \
+		--virtual .${prefix}depends-$pkgname "\$@" || return
+}
+
+# build and install dependencies
+builddeps() {
+	local pkg= i= BUILD_BASE=
+	[ -n "$nodeps" ] && return 0
+
+	msg "Analyzing dependencies..."
+	case "$BOOTSTRAP" in
+	no*)	BUILD_BASE="";;
+	*)	if cross_creating || cross_compiling; then
+			BUILD_BASE="build-base-$CTARGET_ARCH"
+		else
+			BUILD_BASE="build-base"
+		fi
+	esac
+	calcdeps "$BUILD_BASE"
+
+	# shall ccache be added?
+	[ -n "$USE_CCACHE" ] && builddeps="$builddeps ccache"
+
+	# find which deps are missing
+	local mbd mhd missing
+	mbd=$(get_missing_deps "" $builddeps) || return 1
+	mhd=$(get_missing_deps "--root $CBUILDROOT --arch $CTARGET_ARCH" $hostdeps) || return 1
+	missing=$(echo $mbd $mhd)
+
+	if [ -z "$install_deps" ]; then
+		# if we dont have any missing deps we are done now
+		[ -z "$missing" ] && return 0
+		error "Missing dependencies (use -r to autoinstall them): $missing"
+		return 1
+	fi
+
+	uninstall_after=".makedepends-$pkgname $uninstall_after"
+	# make a --simulate run first to detect missing deps
+	# apk-tools --virtual is no goot at reporting those.
+	deps "--quiet --simulate" || return 1
+	deps || return 1
+}
+
+# replace the sha512sums in the APKBUILD
+checksum() {
+	local s files name
+	[ -z "$source" ] && [ -n "${sha256sums}${sha512sums}" ] \
+		&& msg "Removing checksums from $APKBUILD"
+	sed -E -i \
+		-e '/^sha[0-9]+sums=".*"$/d' \
+		-e '/^sha[0-9]+sums="/,/"$/d' \
+		\
+		-e "/^sha[0-9]+sums='.*'\$/d" \
+		-e "/^sha[0-9]+sums='/,/'\$/d" \
+		"$APKBUILD"
+
+	[ -z "$source" ] && return 0
+	fetch
+	for s in $source; do
+		name="$(filename_from_uri $s)"
+		case " $files " in
+		*" $name "*) die "duplicate found in \$source: $name";;
+		esac
+		files="$files $name"
+	done
+
+	msg "Updating the sha512sums in $APKBUILD..."
+	sha256sums=
+	sha512sums="$(cd "$srcdir" && sha512sum $files)" \
+		|| die "sha512sum failed"
+	printf 'sha512sums="\n%s\n"\n' "$sha512sums" >>"$APKBUILD"
+}
+
+rootbld_actions() {
+	local part _check=check
+	if options_has "checkroot"; then
+		_check=check_fakeroot
+	fi
+	if ! want_check; then
+		_check=true
+	fi
+	for part in symlinksrc unpack prepare build $_check rootpkg; do
+		runpart $part
+	done
+}
+
+rootbld_qemu_arch() {
+	local qarch=""
+
+	case "$CBUILD_ARCH" in
+	arm*) qarch="arm" ;;
+	x86)  qarch="i386" ;;
+	*)    qarch="$CBUILD_ARCH" ;;
+	esac
+
+	echo "${qarch}"
+}
+
+rootbld() {
+	if apk_up2date && [ -z "$force" ]; then
+		msg "Package is up to date"
+		return
+	fi
+
+	$APK info -eq abuild-rootbld || die "rootbld: abuild-rootbld package not installed"
+
+	[ $CBUILD = $CHOST ] || die "rootbld: set CBUILD=$CHOST to build for $CHOST"
+
+	local qarch cachedir=""
+	[ -d /etc/apk/cache ] && cachedir=/etc/apk/cache
+	if ! [ $CBUILD_ARCH = "$($APK --print-arch)" ]; then
+		# cross-building, so check for binfmt registration
+		qarch="$(rootbld_qemu_arch)"
+		if ! [ -f "/proc/sys/fs/binfmt_misc/qemu-$qarch" ]; then
+			warning "rootbld: binfmt registration missing for $qarch binaries"
+		fi
+		# Old versions of apk have cache conflicts
+		$APK info -eq 'cmd:apk>=2.14.1' || cachedir=""
+	fi
+
+	logcmd "chroot building building $repo/$pkgname-$pkgver-r$pkgrel"
+
+	# check early if we have abuild key
+	abuild-sign --installed
+
+	# make sure SOURCE_DATE_EPOCH is set
+	set_source_date
+
+	# networking business
+	validate
+	clean
+	fetch
+	verify
+
+	msg "Preparing build chroot..."
+
+	BUILD_ROOT=$(mktemp -d /var/tmp/abuild.XXXXXXXXXX)
+
+	mkdir -p "$BUILD_ROOT/proc" "$BUILD_ROOT/etc/apk/keys" \
+		"$BUILD_ROOT/$ABUILD_USERDIR" "$BUILD_ROOT/$aportsgit" \
+		"$BUILD_ROOT/$SRCDEST" "$BUILD_ROOT/$REPODEST" \
+		"$BUILD_ROOT/tmp/pkg" "$BUILD_ROOT/tmp/src" \
+		"$BUILD_ROOT/tmp/tmp" "$BUILD_ROOT/usr/bin" \
+		"$REPODEST" "$BUILD_ROOT/$HOME/.ccache"
+
+	cp /etc/abuild.conf "$BUILD_ROOT/etc"
+
+	local dir
+	for dir in /usr/share/apk/keys/$CBUILD_ARCH /etc/apk/keys; do
+		cp $dir/* "$BUILD_ROOT/etc/apk/keys"
+	done
+
+	if options_has "net"; then
+		cp /etc/resolv.conf "$BUILD_ROOT/etc"
+	fi
+
+	local version="edge" buildhost="edge" gitref
+	if gitref="$(expr "$($git symbolic-ref --short HEAD)" : '\([0-9]\+\(\.[0-9]\+\)*\)-')"; then
+		version=v${gitref}
+		buildhost=${gitref/./-}
+	fi
+
+	[ -s "$repo_template" ] || die "rootbld: $repo_template does not exist"
+	(
+		for key in $($git config --list --name-only); do
+			k=${key#abuild.}
+			[ $k != $key ] && \
+				eval "export $k=\"$($git config --get $key)\""
+		done
+
+		export mirror version
+		[ "$mirror" ] || mirror=http://dl-cdn.alpinelinux.org/alpine
+
+		envsubst | while read -r repository; do
+			echo "$repository"
+			echo "$REPODEST/${repository##*/}"
+		done
+	) < "$repo_template" > "$BUILD_ROOT/etc/apk/repositories"
+
+	calcdeps
+	echo "installing oils!"
+	$SUDO_APK add --initdb --update \
+		--no-interactive \
+		--arch $CBUILD_ARCH \
+		--root "$BUILD_ROOT" \
+		${cachedir:+--cache-dir $cachedir} \
+		abuild alpine-base build-base git $hostdeps $builddeps oils-for-unix-binsh \
+		${USE_CCACHE:+ccache}
+
+	# busybox adduser/addgroup check if uid is 0 so we need to generate the files manually
+	awk -F: -v pkggroups="$pkggroups" -v pkgusers="$pkgusers" -v root="$BUILD_ROOT" -v home="$HOME" 'BEGIN {
+		gid = 101;
+		split(pkggroups, arr, "[ \t\n]")
+		groups["user"] = "user:x:1000:user"
+		for (i in arr)
+			groups[arr[i]] = arr[i] ":x:" gid++ ":";
+		while (getline < (root "/etc/group"))
+			groups[$1] = $0
+
+		uid = 100;
+		split(pkgusers, arr, "[ \t\n]")
+		users["user"] = "user:x:1000:1000:user:" home ":/bin/sh"
+		for (i in arr) {
+			$0 = groups[arr[i] in groups ? arr[i] : "nobody"]
+			users[arr[i]] = arr[i] ":x:" uid++ ":" $3 ":" arr[i] ":/dev/null:/sbin/nologin";
+		}
+		while (getline < (root "/etc/passwd"))
+			users[$1] = $0
+
+		for (i in groups)
+			printf("%s\n", groups[i]) > (root "/group")
+		for (i in users)
+			printf("%s\n", users[i]) > (root "/passwd")
+	}'
+
+	local bwrap_opts=""
+	options_has "net" || bwrap_opts="$bwrap_opts --unshare-net"
+	bwrap --new-session --unshare-ipc --unshare-uts $bwrap_opts \
+		--unshare-pid --die-with-parent \
+		--uid 1000 --gid 1000 \
+		--ro-bind "$BUILD_ROOT" / \
+		--ro-bind "$BUILD_ROOT"/group /etc/group \
+		--ro-bind "$BUILD_ROOT"/passwd /etc/passwd \
+		--proc /proc \
+		--dev-bind /dev /dev \
+		--bind "$BUILD_ROOT/$HOME" "$HOME" \
+		--ro-bind "$ABUILD_USERDIR" "$ABUILD_USERDIR" \
+		--ro-bind "$aportsgit" "$aportsgit" \
+		${USE_CCACHE:+ --bind "$HOME/.ccache" "$HOME/.ccache"} \
+		--bind "$SRCDEST" "$SRCDEST" \
+		--bind "$BUILD_ROOT/tmp" /tmp \
+		--bind "$BUILD_ROOT/var/tmp" /var/tmp \
+		--bind "$REPODEST" "$REPODEST" \
+		--hostname "build-$buildhost-$CARCH" \
+		--chdir "$startdir" \
+		--clearenv \
+		--setenv abuild_srcdir /tmp/src \
+		--setenv pkgbasedir /tmp/pkg \
+		--setenv tmpdir /tmp/tmp \
+		--setenv CARCH "$CARCH" \
+		--setenv HOME "$HOME" \
+		--setenv REPODEST "$REPODEST" \
+		--setenv SRCDEST "$SRCDEST" \
+		--setenv ABUILD_USERDIR "$ABUILD_USERDIR" \
+		${ABUILD_BOOTSTRAP:+--setenv ABUILD_BOOTSTRAP "$ABUILD_BOOTSTRAP"} \
+		${APORTS_BOOTSTRAP:+--setenv APORTS_BOOTSTRAP "$APORTS_BOOTSTRAP"} \
+		--setenv SOURCE_DATE_EPOCH "$SOURCE_DATE_EPOCH" \
+		--setenv ABUILD_LAST_COMMIT "$ABUILD_LAST_COMMIT" \
+		--setenv PATH ${USE_CCACHE:+/usr/lib/ccache/bin:}/bin:/usr/bin:/sbin:/usr/sbin \
+		--setenv FAKEROOTDONTTRYCHOWN 1 \
+		--unsetenv CBUILD \
+		/usr/bin/abuild $force rootbld_actions
+	update_abuildrepo_index
+	cleanup $CLEANUP
+}
+
+stripbin() {
+	if options_has "!strip" || [ "${subpkgarch:-$pkgarch}" = "noarch" ]; then
+		return 0
+	fi
+	cd "${subpkgdir:-$pkgdir}" || return 1
+
+	local stripcmd=strip
+	case "${subpkgarch:-$pkgarch}" in
+	$CBUILD_ARCH)	stripcmd="strip" ;;
+	$CARCH)		stripcmd="${CHOST}-strip" ;;
+	$CTARGET_ARCH)	stripcmd="${CTARGET}-strip" ;;
+	esac
+
+	msg "Stripping binaries"
+
+	mkdir -p "$pkgbasedir/.strip-tmp"
+	scanelf --recursive --nobanner --osabi --etype "ET_DYN,ET_EXEC" . \
+		| while read type osabi filename; do
+
+		# scanelf may have picked up a temp file so verify that file still exists
+		[ -e "$filename" ] || continue
+
+		case "$filename" in
+			./usr/lib/debug/*) continue ;;
+		esac
+
+		[ "$osabi" != "STANDALONE" ] || continue
+		local tmp="$pkgbasedir/.strip-tmp/${filename##*/}"
+		"${stripcmd}" -o "$tmp" "${filename}"
+		# only replace content to preserve attributes
+		cat "$tmp" > "$filename"
+		rm "$tmp"
+	done
+	rmdir "$pkgbasedir/.strip-tmp"
+}
+
+# simply list target apks
+listpkg() {
+	local name
+	for name in $allpackages ; do
+		subpkg_set $name
+		echo "$subpkgname-$pkgver-r$pkgrel.apk"
+	done
+	subpkg_unset
+}
+
+source_has() {
+	local i
+	for i in $source; do
+		[ "$1" = "${i##*/}" ] && return 0
+		[ "$1" = "${i%%::*}" ] && return 0
+	done
+	return 1
+}
+
+subpackages_has() {
+	local i
+	for i in $subpackages; do
+		[ "$1" = "${i%%:*}" ] && return 0
+	done
+	return 1
+}
+
+subpackage_types_has() {
+	local i
+	for i in $subpackages; do
+		local _name="${i%%:*}"
+		[ "$1" = "${_name##*-}" ] && return 0
+	done
+	return 1
+}
+
+list_has() {
+	local needle="$1"
+	local i
+	shift
+	for i in $@; do
+		[ "$needle" = "$i" ] && return 0
+		[ "$needle" = "!$i" ] && return 1
+	done
+	return 1
+}
+
+# same as list_has but we filter version info
+deplist_has() {
+	local needle="$1"
+	local i
+	shift
+	for i in $@; do
+		i=${i%%[<>=~]*}
+		[ "$needle" = "$i" ] && return 0
+		[ "$needle" = "!$i" ] && return 1
+	done
+	return 1
+}
+
+options_has() {
+	[ -n "${subpkgname:-pkgname}" ] &&
+	list_has "${subpkgname:-pkgname}::$1" $options ||
+	list_has "$1" $options
+}
+
+depends_has() {
+	deplist_has "$1" $depends
+}
+
+makedepends_has() {
+	deplist_has "$1" $makedepends
+}
+
+install_has() {
+	list_has "$1" $install
+}
+
+deps() {
+	[ -z "$hostdeps" -a -z "$builddeps" ] && calcdeps
+
+	local _quiet="$1"
+	[ -z "$_quiet" ] && msg "Installing for build:$builddeps"
+	apk_add_makedeps make $_quiet $builddeps || return 1
+	if [ -n "$CBUILDROOT" ]; then
+		[ -z "$_quiet" ] && msg "Installing for host:$hostdeps"
+		apk_add_makedeps host $_quiet --no-scripts \
+			--root "$CBUILDROOT" --arch "$CTARGET_ARCH" $hostdeps \
+			|| return 1
+	fi
+}
+
+undeps() {
+	local _quiet="$@"
+	$SUDO_APK del --no-interactive $_quiet $apk_opt_wait \
+		.makedepends-$pkgname || :
+	if [ -n "$CBUILDROOT" ]; then
+		$SUDO_APK del --no-interactive $_quiet \
+			--root "$CBUILDROOT" --arch "$CTARGET_ARCH" $apk_opt_wait \
+			--no-scripts .hostdepends-$pkgname || :
+	fi
+}
+
+# compat
+installdeps() { deps; }
+uninstalldeps() { undeps; }
+index() { update_abuildrepo_index; }
+
+all() {
+	if ! [ -n "$force" ] && ! check_arch; then
+		echo "Package not available for the target architecture ($CARCH). Aborting."
+		return 0
+	fi
+	if up2date && [ -z "$force" ]; then
+		msg "Package is up to date"
+	else
+		build_abuildrepo
+	fi
+}
+
+# This abuild hook will checkout an svn or git repository by specifying
+# $giturl in APKBUILD. You can checkout a specific branch in
+# git by adding -b $branch in $giturl. $reporev will select the correct
+# commit, revision or tag for you. If you specify $disturl your distfile
+# will automatically be uploaded with rsync to the url provided.
+# Base version defaults to 0 except if specified by $verbase.
+
+snapshot() {
+	# check if we setup vars correctly
+	[ -z "$disturl" ] && warning "Missing disturl in APKBUILD, auto uploading disabled."
+	[ -z "$giturl" ] && die "Missing repository url in APKBUILD!"
+	local _date
+	_date=$(date +%Y%m%d)
+	local _format="tar.gz"
+	# remove any repositories left in srcdir
+	"$abuild_path" $forceroot clean
+	mkdir -p "$srcdir" && cd "$srcdir"
+	# clone git repo and archive
+	if [ -n "$giturl" ]; then
+		local _version=${verbase:-0}_git${_date}
+		[ "$git" = "true" ] &&  die "Missing git! Install git to support git clone."
+		local _rev="${reporev:-HEAD}"
+		[ "$_rev" = "HEAD" ] && local _depth="--depth=1"
+		msg "Creating git snapshot: $pkgname-$_version"
+		git clone $_depth --bare $giturl $pkgname-$_version || return 1
+		git --git-dir $pkgname-$_version archive \
+			--format=$_format \
+			-o $pkgname-$_version.$_format \
+			--prefix=$pkgname-$_version/ $_rev \
+			|| return 1
+	fi
+	# upload to defined distfiles url
+	if [ -n "$disturl" ]; then
+		command -v rsync >/dev/null || \
+			die "Missing rsync! Install rsync to enable automatic uploads."
+		msg "Uploading to $disturl"
+		rsync --progress -La $pkgname-$_version.$_format \
+			$disturl || return 1
+		cd "$startdir"
+		# set the pkgver to current date and update checksum
+		sed -i -e "s/^pkgver=.*/pkgver=${_version}/" \
+			APKBUILD || return 1
+		"$abuild_path" $forceroot checksum
+	fi
+}
+
+usage() {
+	cat <<-EOF
+		usage: $program [options] [-C DIR] [-P REPODEST] [-s SRCDEST] [-D DESC] [cmd] ...
+		       $program [-c] -n PKGNAME[-PKGVER]
+		Options:
+		 -A  Print CARCH and exit
+		 -c  Enable colored output
+		 -C  Change directory before running any commands
+		 -d  Disable dependency checking
+		 -D  Set APKINDEX description (default: \$repo \$(git describe))
+		 -f  Force specified cmd (skip checks: apk up to date, arch)
+		 -F  Force run as root
+		 -h  Show this help
+		 -k  Keep built packages, even if APKBUILD or sources are newer
+		 -K  Keep buildtime temp dirs and files (srcdir/pkgdir/deps)
+		 -m  Disable colors (monochrome)
+		 -P  Set REPODEST as the repository location for created packages
+		 -q  Quiet
+		 -r  Install missing dependencies from system repository (using \$SUDO_APK)
+		 -s  Set source package destination directory
+		 -v  Verbose: show every command as it is run (very noisy)
+
+		Commands:
+		  build       Compile and install package into \$pkgdir
+		  check       Run any defined tests concerning the package
+		  checksum    Generate checksum to be included in APKBUILD
+		  clean       Remove temp build and install dirs
+		  cleancache  Remove downloaded files from \$SRCDEST
+		  cleanoldpkg Remove binary packages except current version
+		  cleanpkg    Remove already built binary and source package
+		  deps        Install packages listed in makedepends and depends
+		  fetch       Fetch sources to \$SRCDEST (consider: 'abuild fetch verify')
+		  index       Regenerate indexes in \$REPODEST
+		  listpkg     List target packages
+		  package     Install project into \$pkgdir
+		  prepare     Apply patches
+		  rootbld     Build package in clean chroot
+		  rootpkg     Run 'package', the split functions and create apks as fakeroot
+		  validate    Basic validation of APKBUILD
+		  snapshot    Create a \$giturl snapshot and upload to \$disturl
+		  sourcecheck Check if remote source package exists upstream
+		  srcpkg      Make a source package
+		  undeps      Uninstall packages listed in makedepends and depends
+		  unpack      Unpack sources to \$srcdir
+		  up2date     Compare target and sources dates
+		  verify      Verify checksums
+
+		To activate cross compilation specify in environment:
+		  CHOST       Arch or hostspec of machine to generate packages for
+		  CTARGET     Arch or hostspec of machine to generate compiler for
+
+	EOF
+}
+
+APKBUILD="${APKBUILD:-./APKBUILD}"
+unset color_opt force forceroot install_deps keep keep_build nodeps quiet verbose
+while getopts ":AcC:dD:fFhkKmnP:qrRs:uvV" opt; do
+	case $opt in
+		'A') echo "$CARCH"; exit 0;;
+		'c') enable_colors
+		     color_opt="-c";;
+		'C') chdir "$OPTARG";;
+		'd') nodeps="-d";;
+		'D') DESCRIPTION=$OPTARG;;
+		'f') force="-f";;
+		'F') forceroot="-F";;
+		'h') usage; exit 0;;
+		'k') keep="-k";;
+		'K') keep_build="-K";;
+		'm') disable_colors
+		     color_opt="-m";;
+		'n') die "Use newapkbuild to create new aports";;
+		'P') REPODEST=$OPTARG;;
+		'q') quiet="-q";;
+		'r') install_deps="-r";;
+		's') SRCDEST=$OPTARG;;
+		'v') verbose="-v"; set -x;;
+		'V') echo "$program $program_version"; exit 0;;
+		'?') error "Unrecognized option: $OPTARG"; usage >&2; exit 1;;
+	esac
+done
+shift $(( $OPTIND - 1 ))
+
+# check so we are not root
+if [ $(id -u) -eq 0 ] && [ -z "$FAKEROOTKEY" ]; then
+	[ -z "$forceroot" ] && die "Do not run abuild as root"
+	FAKEROOT=
+fi
+
+# check for ccache presence and maybe export its path
+if [ -n "$USE_CCACHE" ]; then
+	mkdir -p "$HOME/.ccache"
+	# prepend ccache path
+	export PATH="/usr/lib/ccache/bin:$PATH"
+fi
+
+# find startdir
+[ -f "$APKBUILD" ] || die "Could not find $APKBUILD (PWD=$PWD)"
+APKBUILD=$(readlink -f "$APKBUILD")
+
+startdir="${APKBUILD%/*}"
+srcdir=${srcdir:-${abuild_srcdir:-"$startdir/src"}}
+pkgbasedir=${pkgbasedir:-"$startdir/pkg"}
+tmpdir=${tmpdir:-"$startdir/tmp"}
+
+repo=${startdir%/*}
+repo=${repo##*/}
+
+aportsgit=${APORTSDIR:-${startdir}}
+repo_template=$startdir/../.rootbld-repositories
+
+SRCDEST=${SRCDEST:-$startdir}
+
+BUILD_ROOT=
+
+export CC CXX
+
+cd "$startdir" || die
+. "$APKBUILD"
+
+builddir=${builddir:-"$srcdir/$pkgname-$pkgver"}
+
+# If REPODEST is set then it will override the PKGDEST
+if [ -z "$REPODEST" ]; then
+	warning "REPODEST is not set and is now required. Defaulting to $HOME/packages"
+	[ -n "$PKGDEST" ] && die "PKGDEST is no longer supported."
+	REPODEST="$HOME/packages"
+fi
+
+# for recursive action
+export REPODEST SRCDEST
+
+# add dbg subpackage if its enabled globally
+if [ -n "$DEFAULT_DBG" ] && ! subpackage_types_has "dbg" && ! options_has "!dbg" && [ "$arch" != "noarch" ]; then
+        subpackages="$pkgname-dbg $subpackages"
+fi
+
+# if we want build debug package
+if [ -n "$DEBUG" ] || subpackage_types_has "dbg"; then
+	CFLAGS="$CFLAGS -g"
+	CXXFLAGS="$CXXFLAGS -g"
+	DFLAGS="$DFLAGS -g"
+	export CARGO_PROFILE_RELEASE_DEBUG=true
+	export CARGO_PROFILE_RELEASE_STRIP=none
+	if [ -n "$DEBUG" ]; then
+		options="$options !strip"
+	fi
+fi
+
+if [ -n "$subpkgname" ]; then
+	# If we are handling a sub package then reset subpackages and install
+	subpackages=
+else
+	allpackages="$pkgname $subpackages"
+fi
+apkbuild_arch="$arch"
+pkgdir="$pkgbasedir/$pkgname"
+if [ -z "$pkgarch" ]; then
+	pkgarch=$CARCH
+	list_has noarch $arch && pkgarch=noarch
+fi
+controldir="$pkgbasedir"/.control.${subpkgname:-$pkgname}
+
+trap 'die "Aborted by user"' INT
+
+[ -z "$subpkgdir" ] && set_xterm_title "abuild${CROSS_COMPILE+-$CARCH}: $pkgname"
+
+if [ -z "$1" ]; then
+	set all
+fi
+
+while [ $# -gt 0 ]; do
+	runpart $1
+	shift
+done
+
+cleanup
