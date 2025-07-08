@@ -8,11 +8,12 @@ url="https://www.oils.pub/"
 arch="all"
 license="Apache-2.0"
 makedepends="readline-dev"
-subpackages="$pkgname-doc $pkgname-binsh::noarch $pkgname-bash::noarch"
 install="
 	$pkgname.post-install $pkgname.post-upgrade $pkgname.pre-deinstall
 	$pkgname-bash.post-install $pkgname-bash.post-upgrade $pkgname-bash.pre-deinstall
 	"
+depends="busybox"
+subpackages="$pkgname-doc $pkgname-binsh::noarch $pkgname-bash::noarch $pkgname-ysh::noarch $pkgname-osh::noarch"
 source="https://oils.pub/download/oils-for-unix-$pkgver.tar.gz"
 
 build() {
@@ -40,10 +41,23 @@ package() {
 binsh() {
 	pkgdesc="oils-for-unix as /bin/sh"
 	provides="/bin/sh"
+	depends="alpine-baselayout-data"
 	provider_priority=10 # lowest (other providers: dash-binsh, busybox-binsh, yash-binsh)
 
 	mkdir -p "$subpkgdir"/bin
 	ln -s /usr/bin/oils-for-unix "$subpkgdir"/bin/sh
+}
+
+# These install files can't be executed
+osh() {
+	depends="alpine-base"
+	install="$pkgname.post-install $pkgname.post-upgrade $pkgname.pre-deinstall"
+	mkdir -p "$subpkgdir"/bin
+}
+ysh() {
+	depends="alpine-base"
+	install="$pkgname.post-install $pkgname.post-upgrade $pkgname.pre-deinstall"
+	mkdir -p "$subpkgdir"/bin
 }
 
 bash() {
