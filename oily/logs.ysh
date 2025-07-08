@@ -1,0 +1,64 @@
+#!/usr/bin/env ysh
+
+var issues_file = "$[ENV.HOME]/oily-pine/oily/logs/issues"
+
+func contains(arr, needle) {
+ if (arr=>indexOf(needle) >= 0) { return (true) }
+ return (false)
+}
+
+proc help() {
+  write '''
+    Analyse build logs!
+
+    categorize   Open not-yet categorized build logs for investigation.
+   		 On exit, list existing categories to select what it is. If none selected (ctrl+c) ask for a new category
+
+
+    stats         Create a statistic from the categories
+    '''
+
+}
+
+proc categorize() {
+  var failed_packages = $(grep ^ERROR ~/oily-pine/oily/logs/*log | tr -d ":" | awk '{ print $2 }')=>split(u'\n')
+  
+  
+  touch $issues_file
+  var issues = []
+  var handled_packages = []
+  for i in ($(cat $issues_file)=>split(u'\n')) {
+    var s = i=>split(" ", count=1)
+    call handled_packages->append(s[0])
+    if (not issues=>contains(s[1])) {
+      call issues->append(s[1])
+    }
+  }
+  
+  for package in (failed_packages) {
+    if (handled_packages=>contains(package)) { continue }
+    echo $package
+  
+    less $[glob("$[ENV.HOME]/logs/*/$package/*log")[0]]
+  
+    try {
+      var name = $({ for i in (issues) { write $[i] } } | fzf)
+    }
+    if (_error.code !== 0) {
+      echo "Enter name for new issue"
+      read name
+      call issues->append(name)
+    }
+    echo "$package $name" >> $issues_file
+  }
+}
+
+proc stats() {
+  cat $issues_file | cut -d ' ' -f2- | sort | uniq -c | sort -nr
+}
+
+if (len(ARGV) < 1) {
+  help
+} else {
+  @ARGV
+}
