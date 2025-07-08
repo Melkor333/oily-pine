@@ -1,0 +1,4 @@
+#!/usr/bin/ysh
+remove-shell '/usr/bin/ysh'
+exit 0
+

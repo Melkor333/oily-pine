@@ -1,0 +1,4 @@
+#!/usr/bin/ysh
+add-shell '/usr/bin/ysh'
+exit 0
+
