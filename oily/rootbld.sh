@@ -2,7 +2,7 @@
 set -e
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
-TEST_PACKAGE="zip"
+TEST_PACKAGE="main/bash"
 doc="
 This script expects a folder $HOME/aports/testing/oils-for-unix/ containing an APKBUILD.
 Instead of using abuild to fetch sources, it will fetch sources from the Oils CI.
@@ -97,7 +97,7 @@ package() {
   if test -n "$1"; then
     TEST_PACKAGE="$1"
   fi
-  cd "$HOME/aports/main/$TEST_PACKAGE"
+  cd "$HOME/aports/$TEST_PACKAGE"
 
   abuild-oils rootbld
 }

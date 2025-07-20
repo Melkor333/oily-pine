@@ -28,7 +28,7 @@ package() {
     $RUNTIME run $RUN_ARGS $MOUNTPOINTS $CONTAINER $@ |& tee -a oily/logs/$(date +%y-%m-%d_%H:%M)-buildrepo.log
   else
     $RUNTIME run $RUN_ARGS $MOUNTPOINTS --entrypoint /usr/bin/ysh $CONTAINER \
-    -c "/home/packager/aports/oily/setup-key.sh; abuild -rC 'aports/$1'"
+    -c "/home/packager/aports/oily/setup-key.sh; cd $HOME/aports/$1; abuild -r"
   fi
 }
 

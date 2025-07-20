@@ -1,6 +1,16 @@
 #!/usr/bin/env ysh
 
-var issues_file = "$[ENV.HOME]/oily-pine/oily/logs/issues"
+setglobal issues_file = "$[ENV.HOME]/oily-pine/oily/logs/issues"
+setglobal logdest = "$[ENV.HOME]/oily-pine/oily/logs/failures/"
+setglobal fixdest = "$[ENV.HOME]/oily-pine/oily/logs/fixed/"
+
+func each(arr, expr) {
+  var o = []
+  for i in (arr) {
+    call o->append(io->evalExpr(expr, pos_args=[i]))
+  }
+  return (o)
+}
 
 func contains(arr, needle) {
  if (arr=>indexOf(needle) >= 0) { return (true) }
@@ -9,20 +19,28 @@ func contains(arr, needle) {
 
 proc help() {
   write '''
-    Analyse build logs!
-
-    categorize   Open not-yet categorized build logs for investigation.
-   		 On exit, list existing categories to select what it is. If none selected (ctrl+c) ask for a new category
+    Analyse and fix build logs!
 
 
-    stats         Create a statistic from the categories
+    rebuild-failed   Select a category of failed packages and it will rebuild
+                     just these packages with `bldroot`.
+                     Remove successful builds from logs/issues
+                     TODO: choose between bldroot/container
+
+    recategorize     Select a category of failures, check the logs of these
+                     packages and recategorize. To be used after rebuild-failed
+
+    stats            Create a statistic from the categories
+
+    categorize       (Only required when never categorized!)
+                     Open not-yet categorized build logs for investigation.
+                     On exit, list existing categories to select what it is.
+                     If none selected (ctrl+c) ask for a new category
     '''
-
 }
 
 proc categorize() {
   var failed_packages = $(grep ^ERROR ~/oily-pine/oily/logs/*log | tr -d ":" | awk '{ print $2 }')=>split(u'\n')
-  
   
   touch $issues_file
   var issues = []
@@ -37,10 +55,10 @@ proc categorize() {
   
   for package in (failed_packages) {
     if (handled_packages=>contains(package)) { continue }
+  
+    bat --paging=always @[glob("$[ENV.HOME]/logs/*/$package/*log")]
+  
     echo $package
-  
-    less $[glob("$[ENV.HOME]/logs/*/$package/*log")[0]]
-  
     try {
       var name = $({ for i in (issues) { write $[i] } } | fzf)
     }
@@ -53,8 +71,84 @@ proc categorize() {
   }
 }
 
+proc recategorize() {
+  var issues = []
+  var packages = []
+  for i in ($(cat $issues_file)=>split(u'\n')) {
+    var s = i=>split(" ", count=1)
+    call packages->append(s)
+    if (not issues=>contains(s[1])) {
+      call issues->append(s[1])
+    }
+  }
+  var issue = $({ for i in (issues) { write $[i] } } | fzf)
+  for p in (packages) {
+    if (issue === p[1]) {
+      echo $[p[0]]
+
+      bat --paging=always @[glob("$logdest/$[p[0]]*log")]
+      try {
+        var name = $({ for i in (issues) { write $[i] } } | fzf)
+      }
+      if (_error.code !== 0) {
+        echo "Enter name for new issue"
+        read name
+        call issues->append(name)
+      }
+      sed -i "s/^$[p[0]] .*/$[p[0]] $name/" $issues_file
+    }
+  }
+}
+
 proc stats() {
   cat $issues_file | cut -d ' ' -f2- | sort | uniq -c | sort -nr
+  wc -l $issues_file
+
+}
+
+update-repo() {
+  var issues = $(cat $issues_file) =>split(u'\n') =>each(^[$1=>split(" ", count=1) ])
+  = issues
+  mkdir $logdest
+  for i in (issues) {
+    cp -v @[glob("$[ENV.HOME]/logs/main/$[i[0]]/*")] $logdest
+  }
+}
+
+rebuild-failed() {
+  var issues = []
+  var packages = []
+  for i in ($(cat $issues_file)=>split(u'\n')) {
+    var s = i=>split(" ", count=1)
+    call packages->append(s)
+    if (not issues=>contains(s[1])) {
+      call issues->append(s[1])
+    }
+  }
+  var issue = $({ for i in (issues) { write $[i] } } | fzf)
+  mkdir -p $fixdest
+  for p in (packages) {
+    if (issue === p[1]) {
+      echo "rebuilding $[p[0]]"
+      var logfiles = glob("$logdest/$[p[0]]*log")
+      assert [len(logfiles) < 2]
+      if (len(logfiles) === 0) {
+        write "$[p[0]] already fixed"
+        sed -i "/^$[p[0]] /d" $issues_file
+        continue
+      }
+      var logfile = logfiles[0]
+      echo "- rebuilding"
+      cd "$[ENV.HOME]/aports/main/$[p[0]]"
+      try {
+        abuild-oils rootbld &> $logfile
+      }
+      if (_error.code === 0) {
+        echo "$[p[0]] Successful!"
+        mv -v $logfile $fixdest
+      }
+    }
+  }
 }
 
 if (len(ARGV) < 1) {
