@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -e
+
+set -eo pipefail
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 TEST_PACKAGE="main/bash"
@@ -9,45 +10,38 @@ Instead of using abuild to fetch sources, it will fetch sources from the Oils CI
 It uses abuild to build and package the sources.
 The apks are then installed to $HOME/packages/testing/x86_64/
 
-all URL [PACKAGE]	 Run all of the below steps in order
+prepare-system        prepare the system to run rootbld builds with Oils
 
-oils URL                 Run the below 3 phases to create a pils-for-unix.apk
+build [URL]           Build an oils-for-unix.apk used for later packaging
+                      if no URL is given, just build the existing APKBUILD.
+                      Otherwise fetch the URL - which needs to be
+                      from the Oils CI! Official tarballs are a different
+                      format and don't work here.
+                      Change the APKBUILD file in case of a new release.
 
-prepare-oils URL         Download a oils tarball and unpack it, requires URL of a .tar
-
-build-oils               Run the oils 'build' step (configure and _oils/build.sh)
-			 uses 'abuild' phases
-
-package-oils             Delete existing packages, run the './install' phase and
-                         create a new .apk
-			 uses 'abuild' phases
-
-package [PACKAGE]        Try to build PACKAGE (default: $TEST_PACKAGE) with a
-                         previously built oils as /bin/sh *in a rootbld* ('abuild-oils rootbld')
-             	         This depends on the file
-	     	         $HOME/aports/main/.rootbld-repositories
-	     	         containing the line line:
-	     	         $HOME/packages/testing/
+package [PACKAGE]     Build a package. If no package given, try to build all
+                      packages
+                      A package must contain the repository name, e.g. `main/bash`
 "
 
 die() {
   echo "$@"
-  echo "$doc"	  
+  echo "$doc"
   exit 1
 }
 
-all() {
-  oils "$1"
-  package "$2"
+build() {
+  if [[ -z "$1" ]]; then
+    cd $HOME/aports/testing/oils-for-unix
+    abuild -r
+  else
+    prepare-oils "$1"
+    build-oils
+    package-oils
+  fi
 }
 
-oils() {
-  prepare-oils "$1"
-  build-oils
-  package-oils
-}
-
-prepare-vm() {
+prepare-system() {
   cd $HOME
 
   if ! [[ -L aports ]]; then
@@ -66,9 +60,10 @@ prepare-vm() {
   fi
 }
 
+# Download a oils tarball and unpack it, requires URL of a .tar
 prepare-oils() {
   test -n "$1" || die "Need a oils download url as argument"
-  
+
   cd "$HOME/aports/testing/oils-for-unix"
   test -d src && mv src src.$(date -Iminutes)
   mkdir src
@@ -79,31 +74,30 @@ prepare-oils() {
   (source ../APKBUILD; mv * oils-for-unix-$pkgver)
 }
 
+# Run the oils 'build' step (configure and _oils/build.sh)
 build-oils() {
   cd /home/packager/aports/testing/oils-for-unix
   abuild build
 }
 
+# Delete existing oils packages, run the './install' phase and
+# create a new .apk
 package-oils() {
   cd "$HOME/aports/testing/oils-for-unix"
-  
+
   test -d pkg && mv pkg pkg.$(date -Iminutes)
   rm -r "$HOME/packages/testing/x86_64/oils-for-unix-"* || true
-  
+
   abuild package rootpkg index
 }
 
 package() {
-  if test -n "$1"; then
-    TEST_PACKAGE="$1"
+  if test -z "$1"; then
+    "$SCRIPT_DIR/rootbld/package.sh" |& tee "$SCRIPT_DIR/logs/$(date +%y-%m-%d_%H:%M)-buildrepo.log"
+  else
+    cd "$HOME/aports/$1"
+    abuild-oils rootbld
   fi
-  cd "$HOME/aports/$TEST_PACKAGE"
-
-  abuild-oils rootbld
-}
-
-buildrepo() {
-  time "$SCRIPT_DIR/rootbld/package.sh" |& tee "$SCRIPT_DIR/logs/$(date +%y-%m-%d_%H:%M)-buildrepo.log"
 }
 
 # --------
