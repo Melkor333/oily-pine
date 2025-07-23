@@ -21,7 +21,7 @@ build [URL]           Build an oils-for-unix.apk used for later packaging
 
 package [PACKAGE]     Build a package. If no package given, try to build all
                       packages
-                      A package must contain the repository name, e.g. `main/bash`
+                      A package must contain the repository name, e.g. 'main/bash'
 "
 
 die() {
@@ -32,6 +32,7 @@ die() {
 
 build() {
   if [[ -z "$1" ]]; then
+    cleanup-existing-oils
     cd $HOME/aports/testing/oils-for-unix
     abuild -r
   else
@@ -80,13 +81,17 @@ build-oils() {
   abuild build
 }
 
+cleanup-existing-oils() {
+  rm -r "$HOME/packages/testing/x86_64/oils-for-unix-"* || true
+}
+
 # Delete existing oils packages, run the './install' phase and
 # create a new .apk
 package-oils() {
   cd "$HOME/aports/testing/oils-for-unix"
 
   test -d pkg && mv pkg pkg.$(date -Iminutes)
-  rm -r "$HOME/packages/testing/x86_64/oils-for-unix-"* || true
+  cleanup-existing-oils
 
   abuild package rootpkg index
 }
