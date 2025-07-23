@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 
 set -eo pipefail
-
-
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-cd "$SCRIPT_DIR/.."
+
+
+
+# Container name
 CONTAINER="oily-pine-builder"
+
+# Decide between podman and docker
 RUNTIME=$(command -v podman || command -v docker || { echo 'need docker or podman' >&2 ; exit 1; })
 echo "using '$RUNTIME'"
 MOUNTPOINTS="-v ./:/home/packager/aports -v ./oily/abuild:/home/packager/.abuild -v ./oily/logs:/home/packager/logs -v ./oily/packages:/home/packager/packages"
 RUN_ARGS="--rm"
 if [[ "$RUNTIME" =~ .*"podman" ]]; then
+  # We want to map the userid when using podman. TODO: similar thing for docker
   RUN_ARGS="$RUN_ARGS --userns=keep-id:uid=1000,gid=1000"
 fi
 
+cd "$SCRIPT_DIR/.."
 
 build() {
   if test -n "$1"; then
@@ -61,4 +66,5 @@ if test -z "$*"; then
   usage
   exit 1
 fi
+
 $@
