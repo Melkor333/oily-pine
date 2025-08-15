@@ -19,5 +19,6 @@ RUN ./install-dirty-oils.sh
 
 VOLUME ["/home/packager/.abuild"]
 VOLUME ["/home/packager/aports"]
+VOLUME ["/home/packager/logs"]
 VOLUME ["/home/packager/packages"]
 ENTRYPOINT ["/home/packager/aports/oily/container/package.sh"]
