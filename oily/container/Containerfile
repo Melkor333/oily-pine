@@ -10,8 +10,8 @@ WORKDIR /home/packager
 
 # Build nightly Oils
 # Comment out for latest alpine build
-ADD install-dirty-oils.sh install-dirty-oils.sh
-RUN ./install-dirty-oils.sh
+#ADD install-dirty-oils.sh install-dirty-oils.sh
+#RUN ./install-dirty-oils.sh
 
 # Patch buildrepo to use upstream packages
 # Apparently not necessary, only when `-s` is used...
