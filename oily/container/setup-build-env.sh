@@ -20,6 +20,9 @@ chown -R packager /home/packager
 
 apk cache clean --purge
 
+rm /bin/ash
+ln -s /usr/bin/oils-for-unix /bin/ash
+
 ## TODO: For testing
 #echo '/packages/main' > /etc/apk/repositories
 #echo '/packages/community' >> /etc/apk/repositories
